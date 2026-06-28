@@ -913,6 +913,11 @@ CopyAllDevices() {
   return Reference<Array<Device>>(WMTCopyAllDevices());
 }
 
+inline void
+EnableDeveloperHUD() {
+  WMTEnableDeveloperHUD();
+}
+
 class CaptureManager : public Object {
 public:
   static CaptureManager

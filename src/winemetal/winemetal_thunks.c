@@ -1179,3 +1179,9 @@ MTLDevice_newTileRenderPipelineState(
     *err_out = params.ret_error;
   return params.ret_pso;
 }
+
+WINEMETAL_API void
+WMTEnableDeveloperHUD() {
+  uint64_t unused = 0;
+  UNIX_CALL(132, &unused);
+}

@@ -1,5 +1,8 @@
 #include <stdatomic.h>
 #include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 #import <Cocoa/Cocoa.h>
 #import <ColorSync/ColorSync.h>
 #import <CoreFoundation/CFRunLoop.h>
@@ -16,6 +19,17 @@
 typedef int NTSTATUS;
 #define STATUS_SUCCESS 0
 #define STATUS_UNSUCCESSFUL 0xC0000001
+
+// When the user requests the DXMT HUD (DXMT_HUD), enable Apple's Metal
+// performance HUD on DXMT's behalf so the user never has to set MTLHUDEnabled
+// themselves. Runs at library load, before any Metal device is created, which
+// is when the framework samples this variable.
+__attribute__((constructor)) static void
+dxmt_enable_metal_hud(void) {
+  const char *hud = getenv("DXMT_HUD");
+  if (hud && hud[0] != '\0' && strcmp(hud, "0") != 0)
+    setenv("MTLHUDEnabled", "1", 1);
+}
 
 void
 execute_on_main(dispatch_block_t block) {
@@ -358,6 +372,29 @@ _MTLDevice_newLibrary(void *obj) {
   struct unixcall_mtldevice_newlibrary *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   NSError *err = NULL;
+
+  // DEBUG: dump every metallib so we can analyze the failing bitcode offline.
+  {
+    static atomic_int counter = 0;
+    int idx = atomic_fetch_add(&counter, 1);
+    dispatch_data_t dd = (dispatch_data_t)params->data;
+    const void *buf = NULL;
+    size_t len = 0;
+    dispatch_data_t mapped = dispatch_data_create_map(dd, &buf, &len);
+    char path[256];
+    snprintf(path, sizeof(path), "/Users/Shared/dxmt_lib_%03d.metallib", idx);
+    FILE *df = fopen(path, "wb");
+    if (df) { if (buf && len) fwrite(buf, 1, len, df); fclose(df); }
+    FILE *lf = fopen("/Users/Shared/dxmt_newlib.log", "a");
+    if (lf) {
+      const unsigned char *b = (const unsigned char *)buf;
+      fprintf(lf, "lib[%d] size=%zu magic=%c%c%c%c\n", idx, len,
+              len>0?b[0]:'?', len>1?b[1]:'?', len>2?b[2]:'?', len>3?b[3]:'?');
+      fclose(lf);
+    }
+    if (mapped) dispatch_release(mapped);
+  }
+
   params->ret_library = (obj_handle_t)[device newLibraryWithData:(dispatch_data_t)params->data error:&err];
   params->ret_error = (obj_handle_t)err;
   return STATUS_SUCCESS;
@@ -1489,6 +1526,44 @@ _NSString_alloc_init(void *obj) {
   struct unixcall_nsstring_string *params = obj;
   NSString *str = [[NSString alloc] initWithCString:params->buffer_ptr.ptr encoding:(NSStringEncoding)params->encoding];
   params->ret = (obj_handle_t)str;
+  return STATUS_SUCCESS;
+}
+
+// Enables Apple's Metal Performance HUD from the Windows side. DXMT_HUD is read
+// by the PE side from the Windows environment, which under CrossOver is not the
+// same environment the unix-side constructor sees, so the constructor's getenv
+// may miss it. The PE side calls this before device creation as a reliable
+// bridge. setenv is honoured because Metal samples MTLHUDEnabled when the device
+// is created, which always happens after the first unix call.
+static NTSTATUS
+_WMTEnableDeveloperHUD(void *obj) {
+  setenv("MTLHUDEnabled", "1", 1);
+
+  // Capability probe: confirm whether the unix-side process can write files
+  // and exec subprocesses (needed for the air-as shader path). Writes results
+  // to several locations so we can find whichever is permitted.
+  {
+    const char *paths[] = {
+      "/Users/Shared/dxmt_probe.txt",
+      "/tmp/dxmt_probe.txt",
+      NULL,
+    };
+    char cwd[1024] = {0};
+    getcwd(cwd, sizeof(cwd));
+    for (int i = 0; paths[i]; i++) {
+      FILE *f = fopen(paths[i], "w");
+      if (f) {
+        fprintf(f, "unix process alive\ncwd=%s\n", cwd);
+        fclose(f);
+      }
+    }
+    // Probe exec: run air-as --version, capture to a file.
+    int rc = system(
+      "/usr/bin/xcrun --find air-as > /Users/Shared/dxmt_probe_airas.txt 2>&1; "
+      "echo rc=$? >> /Users/Shared/dxmt_probe_airas.txt");
+    FILE *rf = fopen("/Users/Shared/dxmt_probe_exec.txt", "w");
+    if (rf) { fprintf(rf, "system() returned %d\n", rc); fclose(rf); }
+  }
   return STATUS_SUCCESS;
 }
 
@@ -2999,6 +3074,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
     &_MTLCommandBuffer_property,
     &_MTLDevice_newTileRenderPipelineState,
+    &_WMTEnableDeveloperHUD,
 };
 
 #ifndef DXMT_NATIVE
@@ -3135,5 +3211,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
     &_MTLCommandBuffer_property,
     &_MTLDevice_newTileRenderPipelineState,
+    &_WMTEnableDeveloperHUD,
 };
 #endif

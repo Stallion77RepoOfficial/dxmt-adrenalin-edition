@@ -811,67 +811,78 @@ public:
   };
 
   void UpdateStatistics(const FrameStatisticsContainer& statistics, uint64_t frame_id) {
+    if (!hud.enabled())
+      return;
     hud.begin();
     auto &frame = statistics.at(frame_id - 1); // show the previous one frame statistics
     auto &average = statistics.average();
-    Flags<FeatureCompatibility> flags = frame.compatibility_flags;
-    char text[] = "---------------------------";
-    if (flags.test(FeatureCompatibility::UnsupportedGeometryDraw)) {
-      text[3] = 'G';
+    if (hud.shows(HudElement::Compat)) {
+      Flags<FeatureCompatibility> flags = frame.compatibility_flags;
+      char text[] = "---------------------------";
+      if (flags.test(FeatureCompatibility::UnsupportedGeometryDraw)) {
+        text[3] = 'G';
+      }
+      if (flags.test(FeatureCompatibility::UnsupportedTessellationOutputPrimitive)) {
+        text[5] = 'T';
+        text[6] = 'O';
+      }
+      if (flags.test(FeatureCompatibility::UnsupportedIndirectTessellationDraw)) {
+        text[8] = 'I';
+        text[9] = 'T';
+      }
+      if (flags.test(FeatureCompatibility::UnsupportedGeometryTessellationDraw)) {
+        text[11] = 'G';
+        text[12] = 'T';
+      }
+      if (flags.test(FeatureCompatibility::UnsupportedDrawAuto)) {
+        text[14] = 'A';
+      }
+      if (flags.test(FeatureCompatibility::UnsupportedPredication)) {
+        text[16] = 'P';
+      }
+      if (flags.test(FeatureCompatibility::UnsupportedStreamOutputAppending)) {
+        text[18] = 'S';
+        text[19] = 'A';
+      }
+      if (flags.test(FeatureCompatibility::UnsupportedMultipleStreamOutput)) {
+        text[21] = 'M';
+        text[22] = 'S';
+      }
+      hud.printLine(text);
     }
-    if (flags.test(FeatureCompatibility::UnsupportedTessellationOutputPrimitive)) {
-      text[5] = 'T';
-      text[6] = 'O';
+    if (hud.shows(HudElement::Commit)) {
+      hud.printLine(std::format(
+          "Commit: {:2} -{:4.1f} -{:4.1f}", std::min(frame.command_buffer_count, 99u),
+          std::min(average.commit_interval.count() / 1000000.0, 99.9),
+          std::min(statistics.max().commit_interval.count() / 1000000.0, 99.9)
+      ));
     }
-    if (flags.test(FeatureCompatibility::UnsupportedIndirectTessellationDraw)) {
-      text[8] = 'I';
-      text[9] = 'T';
+    if (hud.shows(HudElement::Sync)) {
+      hud.printLine(std::format(
+          "Sync:   {:2} {:4.1f}  {:2} {:4.1f} {:2}", std::min(frame.sync_count, 99u),
+          std::min(average.sync_interval.count() / 1000000.0, 99.9), std::min(statistics.max().event_stall, 99u),
+          std::min(average.present_latency_interval.count() / 1000000.0, 99.9), frame.latency
+      ));
     }
-    if (flags.test(FeatureCompatibility::UnsupportedGeometryTessellationDraw)) {
-      text[11] = 'G';
-      text[12] = 'T';
+    if (hud.shows(HudElement::Encode)) {
+      hud.printLine(std::format(
+          "Encode: {:4.1f}+{:4.1f}+{:4.1f}={:4.1f}", std::min(average.encode_prepare_interval.count() / 1000000.0, 99.9),
+          std::min((average.encode_flush_interval - average.drawable_blocking_interval).count() / 1000000.0, 99.9),
+          std::min(average.drawable_blocking_interval.count() / 1000000.0, 99.9),
+          std::min((average.encode_prepare_interval + average.encode_flush_interval).count() / 1000000.0, 99.9)
+      ));
     }
-    if (flags.test(FeatureCompatibility::UnsupportedDrawAuto)) {
-      text[14] = 'A';
+    if (hud.shows(HudElement::RenderPass)) {
+      hud.printLine(std::format(
+          "Render:{:3}+{:<3} Clear:{:3}+{:<2}", std::min(frame.render_pass_count - frame.render_pass_optimized, 999u),
+          std::min(frame.render_pass_optimized, 999u),
+          std::min(frame.clear_pass_count - frame.clear_pass_optimized, 999u), std::min(frame.clear_pass_optimized, 99u)
+      ));
     }
-    if (flags.test(FeatureCompatibility::UnsupportedPredication)) {
-      text[16] = 'P';
-    }
-    if (flags.test(FeatureCompatibility::UnsupportedStreamOutputAppending)) {
-      text[18] = 'S';
-      text[19] = 'A';
-    }
-    if (flags.test(FeatureCompatibility::UnsupportedMultipleStreamOutput)) {
-      text[21] = 'M';
-      text[22] = 'S';
-    }
-    hud.printLine(text);
-    hud.printLine(std::format(
-        "Commit: {:2} -{:4.1f} -{:4.1f}", std::min(frame.command_buffer_count, 99u),
-        std::min(average.commit_interval.count() / 1000000.0, 99.9),
-        std::min(statistics.max().commit_interval.count() / 1000000.0, 99.9)
-    ));
-    hud.printLine(std::format(
-        "Sync:   {:2} {:4.1f}  {:2} {:4.1f} {:2}", std::min(frame.sync_count, 99u),
-        std::min(average.sync_interval.count() / 1000000.0, 99.9), std::min(statistics.max().event_stall, 99u),
-        std::min(average.present_latency_interval.count() / 1000000.0, 99.9), frame.latency
-    ));
-    hud.printLine(std::format(
-        "Encode: {:4.1f}+{:4.1f}+{:4.1f}={:4.1f}", std::min(average.encode_prepare_interval.count() / 1000000.0, 99.9),
-        std::min((average.encode_flush_interval - average.drawable_blocking_interval).count() / 1000000.0, 99.9),
-        std::min(average.drawable_blocking_interval.count() / 1000000.0, 99.9),
-        std::min((average.encode_prepare_interval + average.encode_flush_interval).count() / 1000000.0, 99.9)
-    ));
-    hud.printLine(std::format(
-        "Render:{:3}+{:<3} Clear:{:3}+{:<2}", std::min(frame.render_pass_count - frame.render_pass_optimized, 999u),
-        std::min(frame.render_pass_optimized, 999u),
-        std::min(frame.clear_pass_count - frame.clear_pass_optimized, 999u), std::min(frame.clear_pass_optimized, 99u)
-    ));
-    {
+    if (hud.shows(HudElement::Scaler)) {
       /* scaler info */
       auto &info = frame.last_scaler_info;
       if (info.type == ScalerType::Temporal) {
-        auto &info = frame.last_scaler_info;
         hud.printLine(std::format(
             "MetalFX: Temporal {} {}", info.auto_exposure ? "AEXP" : "", info.motion_vector_highres ? "HMV" : ""
         ));
