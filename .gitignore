@@ -17,3 +17,5 @@ ref.sh
 *.test
 releases
 prefixes
+docs/LLVM22_AIR_COMPAT_PATCH_PLAN.md
+/tools

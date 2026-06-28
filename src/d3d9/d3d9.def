@@ -1,11 +1,11 @@
 LIBRARY D3D9.DLL
 EXPORTS
-    Direct3DCreate9     @1
-    Direct3DCreate9Ex   @2
-    D3DPERF_BeginEvent  @3
-    D3DPERF_EndEvent    @4
-    D3DPERF_SetMarker   @5
-    D3DPERF_SetRegion   @6
-    D3DPERF_QueryRepeatFrame @7
-    D3DPERF_SetOptions  @8
-    D3DPERF_GetStatus   @9
+    Direct3DCreate9
+    Direct3DCreate9Ex
+    D3DPERF_BeginEvent
+    D3DPERF_EndEvent
+    D3DPERF_GetStatus
+    D3DPERF_QueryRepeatFrame
+    D3DPERF_SetMarker
+    D3DPERF_SetOptions
+    D3DPERF_SetRegion

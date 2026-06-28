@@ -1,166 +1,118 @@
 #include "d3d9_buffer.hpp"
 #include "d3d9_device.hpp"
-#include "d3d9_format.hpp"
-#include "log/log.hpp"
-#include <cstring>
 
-namespace dxmt::d3d9 {
+namespace dxmt {
 
-// --- D3D9VertexBuffer ---
+namespace {
 
-D3D9VertexBuffer::D3D9VertexBuffer(D3D9Device *pDevice, UINT length, DWORD usage, DWORD fvf, D3DPOOL pool)
-    : m_device(pDevice), m_length(length), m_usage(usage), m_fvf(fvf), m_pool(pool) {
-    m_dynamic = (usage & D3DUSAGE_DYNAMIC) != 0;
-    m_sysMemData.resize(length, 0);
+// Bind flag for the backing ID3D11Buffer, selected by the D3D9 interface type.
+template <typename Interface> UINT BufferBindFlag();
+template <> UINT BufferBindFlag<IDirect3DVertexBuffer9>() { return D3D11_BIND_VERTEX_BUFFER; }
+template <> UINT BufferBindFlag<IDirect3DIndexBuffer9>()  { return D3D11_BIND_INDEX_BUFFER;  }
 
-    if (pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH)
-        return;
+} // namespace
 
-    D3D11_BUFFER_DESC desc = {};
-    desc.ByteWidth      = length;
-    desc.StructureByteStride = 0;
-    if (m_dynamic) {
-        desc.Usage          = D3D11_USAGE_DYNAMIC;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    } else {
-        desc.Usage          = D3D11_USAGE_DEFAULT;
-        desc.CPUAccessFlags = 0;
+template <typename Interface, typename DescType>
+D3D9Buffer<Interface, DescType>::D3D9Buffer(
+    D3D9Device *pDevice, UINT Length, DWORD Usage, D3DPOOL Pool, const DescType &Desc)
+    : device_(pDevice), length_(Length), desc_(Desc) {
+  // DYNAMIC is only honoured for the default pool; managed/system buffers live
+  // in their CPU shadow and are uploaded with UpdateSubresource.
+  dynamic_ = (Usage & D3DUSAGE_DYNAMIC) && Pool == D3DPOOL_DEFAULT;
+
+  shadow_.resize(Length, 0);
+
+  D3D11_BUFFER_DESC bd = {};
+  bd.ByteWidth      = Length;
+  bd.BindFlags      = BufferBindFlag<Interface>();
+  bd.MiscFlags      = 0;
+  bd.StructureByteStride = 0;
+  if (dynamic_) {
+    bd.Usage          = D3D11_USAGE_DYNAMIC;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+  } else {
+    bd.Usage          = D3D11_USAGE_DEFAULT;
+    bd.CPUAccessFlags = 0;
+  }
+
+  device_->GetD3D11Device()->CreateBuffer(&bd, nullptr, &buffer_);
+}
+
+template <typename Interface, typename DescType>
+HRESULT STDMETHODCALLTYPE
+D3D9Buffer<Interface, DescType>::GetDevice(IDirect3DDevice9 **ppDevice) {
+  if (!ppDevice) return D3DERR_INVALIDCALL;
+  *ppDevice = ref(device_);
+  return D3D_OK;
+}
+
+template <typename Interface, typename DescType>
+HRESULT STDMETHODCALLTYPE
+D3D9Buffer<Interface, DescType>::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWORD Flags) {
+  if (!ppbData) return D3DERR_INVALIDCALL;
+  if (locked_)  return D3DERR_INVALIDCALL;
+
+  // A size of 0 means "lock the entire buffer from OffsetToLock".
+  if (SizeToLock == 0)
+    SizeToLock = length_ - OffsetToLock;
+  if (OffsetToLock > length_ || SizeToLock > length_ - OffsetToLock)
+    return D3DERR_INVALIDCALL;
+
+  lock_offset_ = OffsetToLock;
+  lock_size_   = SizeToLock;
+  lock_flags_  = Flags;
+  locked_      = true;
+
+  *ppbData = shadow_.data() + OffsetToLock;
+  return D3D_OK;
+}
+
+template <typename Interface, typename DescType>
+HRESULT STDMETHODCALLTYPE
+D3D9Buffer<Interface, DescType>::Unlock() {
+  if (!locked_) return D3DERR_INVALIDCALL;
+  locked_ = false;
+
+  // Read-only locks never modify the buffer, so skip the upload entirely.
+  if (lock_flags_ & D3DLOCK_READONLY)
+    return D3D_OK;
+
+  auto *ctx = device_->GetD3D11Context();
+
+  if (dynamic_) {
+    // DISCARD / NO_OVERWRITE map straight onto the D3D11 dynamic-buffer hints.
+    // Without either hint D3D9 still allows the write, so default to DISCARD to
+    // avoid stalling on in-flight GPU reads.
+    D3D11_MAP map = D3D11_MAP_WRITE_DISCARD;
+    if (lock_flags_ & D3DLOCK_NOOVERWRITE)
+      map = D3D11_MAP_WRITE_NO_OVERWRITE;
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (SUCCEEDED(ctx->Map(buffer_.ptr(), 0, map, 0, &mapped))) {
+      // WRITE_DISCARD requires the whole buffer to be rewritten; copy the full
+      // shadow so untouched bytes remain valid after the discard.
+      if (map == D3D11_MAP_WRITE_DISCARD)
+        memcpy(mapped.pData, shadow_.data(), length_);
+      else
+        memcpy(static_cast<uint8_t *>(mapped.pData) + lock_offset_,
+               shadow_.data() + lock_offset_, lock_size_);
+      ctx->Unmap(buffer_.ptr(), 0);
     }
-    desc.BindFlags      = D3D11_BIND_VERTEX_BUFFER;
-    desc.MiscFlags      = 0;
-
-    D3D11_SUBRESOURCE_DATA initData = {};
-    initData.pSysMem = m_sysMemData.data();
-
-    ID3D11Device *d3d = pDevice->GetD3D11Device();
-    HRESULT hr = d3d->CreateBuffer(&desc, &initData, &m_buffer);
-    if (FAILED(hr))
-        Logger::err("D3D9VertexBuffer: Failed to create D3D11 buffer");
+  } else {
+    // Push just the dirtied range to the default-usage buffer.
+    D3D11_BOX box = {};
+    box.left   = lock_offset_;
+    box.right  = lock_offset_ + lock_size_;
+    box.top    = 0; box.bottom = 1;
+    box.front  = 0; box.back   = 1;
+    ctx->UpdateSubresource(buffer_.ptr(), 0, &box,
+                           shadow_.data() + lock_offset_, 0, 0);
+  }
+  return D3D_OK;
 }
 
-D3D9VertexBuffer::~D3D9VertexBuffer() {}
+// Explicit instantiations for the two concrete buffer kinds.
+template class D3D9Buffer<IDirect3DVertexBuffer9, D3DVERTEXBUFFER_DESC>;
+template class D3D9Buffer<IDirect3DIndexBuffer9, D3DINDEXBUFFER_DESC>;
 
-HRESULT STDMETHODCALLTYPE D3D9VertexBuffer::QueryInterface(REFIID riid, void **ppvObject) {
-    if (!ppvObject) return E_POINTER;
-    if (riid == IID_IUnknown || riid == IID_IDirect3DResource9 || riid == IID_IDirect3DVertexBuffer9) {
-        *ppvObject = static_cast<IDirect3DVertexBuffer9*>(this);
-        AddRef();
-        return S_OK;
-    }
-    return E_NOINTERFACE;
-}
-
-HRESULT STDMETHODCALLTYPE D3D9VertexBuffer::GetDevice(IDirect3DDevice9 **ppDevice) {
-    if (!ppDevice) return D3DERR_INVALIDCALL;
-    *ppDevice = static_cast<IDirect3DDevice9*>(m_device);
-    (*ppDevice)->AddRef();
-    return D3D_OK;
-}
-
-HRESULT STDMETHODCALLTYPE D3D9VertexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWORD Flags) {
-    if (!ppbData) return D3DERR_INVALIDCALL;
-    m_locked     = true;
-    m_lockOffset = OffsetToLock;
-    m_lockSize   = SizeToLock ? SizeToLock : m_length - OffsetToLock;
-    m_lockFlags  = Flags;
-    *ppbData = m_sysMemData.data() + OffsetToLock;
-    return D3D_OK;
-}
-
-HRESULT STDMETHODCALLTYPE D3D9VertexBuffer::Unlock() {
-    if (!m_locked) return D3D_OK;
-    m_locked = false;
-    m_device->UploadBufferToGPU(this);
-    return D3D_OK;
-}
-
-HRESULT STDMETHODCALLTYPE D3D9VertexBuffer::GetDesc(D3DVERTEXBUFFER_DESC *pDesc) {
-    if (!pDesc) return D3DERR_INVALIDCALL;
-    pDesc->Format = D3DFMT_VERTEXDATA;
-    pDesc->Type   = D3DRTYPE_VERTEXBUFFER;
-    pDesc->Usage  = m_usage;
-    pDesc->Pool   = m_pool;
-    pDesc->Size   = m_length;
-    pDesc->FVF    = m_fvf;
-    return D3D_OK;
-}
-
-// --- D3D9IndexBuffer ---
-
-D3D9IndexBuffer::D3D9IndexBuffer(D3D9Device *pDevice, UINT length, DWORD usage, D3DFORMAT format, D3DPOOL pool)
-    : m_device(pDevice), m_length(length), m_usage(usage), m_format(format), m_pool(pool) {
-    m_dynamic = (usage & D3DUSAGE_DYNAMIC) != 0;
-    m_sysMemData.resize(length, 0);
-
-    if (pool == D3DPOOL_SYSTEMMEM || pool == D3DPOOL_SCRATCH)
-        return;
-
-    D3D11_BUFFER_DESC desc = {};
-    desc.ByteWidth      = length;
-    if (m_dynamic) {
-        desc.Usage          = D3D11_USAGE_DYNAMIC;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-    } else {
-        desc.Usage          = D3D11_USAGE_DEFAULT;
-        desc.CPUAccessFlags = 0;
-    }
-    desc.BindFlags      = D3D11_BIND_INDEX_BUFFER;
-    desc.MiscFlags      = 0;
-
-    D3D11_SUBRESOURCE_DATA initData = {};
-    initData.pSysMem = m_sysMemData.data();
-
-    ID3D11Device *d3d = pDevice->GetD3D11Device();
-    HRESULT hr = d3d->CreateBuffer(&desc, &initData, &m_buffer);
-    if (FAILED(hr))
-        Logger::err("D3D9IndexBuffer: Failed to create D3D11 buffer");
-}
-
-D3D9IndexBuffer::~D3D9IndexBuffer() {}
-
-HRESULT STDMETHODCALLTYPE D3D9IndexBuffer::QueryInterface(REFIID riid, void **ppvObject) {
-    if (!ppvObject) return E_POINTER;
-    if (riid == IID_IUnknown || riid == IID_IDirect3DResource9 || riid == IID_IDirect3DIndexBuffer9) {
-        *ppvObject = static_cast<IDirect3DIndexBuffer9*>(this);
-        AddRef();
-        return S_OK;
-    }
-    return E_NOINTERFACE;
-}
-
-HRESULT STDMETHODCALLTYPE D3D9IndexBuffer::GetDevice(IDirect3DDevice9 **ppDevice) {
-    if (!ppDevice) return D3DERR_INVALIDCALL;
-    *ppDevice = static_cast<IDirect3DDevice9*>(m_device);
-    (*ppDevice)->AddRef();
-    return D3D_OK;
-}
-
-HRESULT STDMETHODCALLTYPE D3D9IndexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWORD Flags) {
-    if (!ppbData) return D3DERR_INVALIDCALL;
-    m_locked = true;
-    *ppbData = m_sysMemData.data() + OffsetToLock;
-    return D3D_OK;
-}
-
-HRESULT STDMETHODCALLTYPE D3D9IndexBuffer::Unlock() {
-    if (!m_locked) return D3D_OK;
-    m_locked = false;
-    m_device->UploadBufferToGPU(this);
-    return D3D_OK;
-}
-
-HRESULT STDMETHODCALLTYPE D3D9IndexBuffer::GetDesc(D3DINDEXBUFFER_DESC *pDesc) {
-    if (!pDesc) return D3DERR_INVALIDCALL;
-    pDesc->Format = m_format;
-    pDesc->Type   = D3DRTYPE_INDEXBUFFER;
-    pDesc->Usage  = m_usage;
-    pDesc->Pool   = m_pool;
-    pDesc->Size   = m_length;
-    return D3D_OK;
-}
-
-DXGI_FORMAT D3D9IndexBuffer::GetFormat() const {
-    return (m_format == D3DFMT_INDEX16) ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
-}
-
-} // namespace dxmt::d3d9
+} // namespace dxmt

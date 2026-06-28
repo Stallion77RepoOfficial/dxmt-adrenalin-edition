@@ -2,7 +2,7 @@
 #include "d3d9_caps.hpp"
 #include "d3d9_format.hpp"
 #include "d3d9_device.hpp"
-#include "d3d9_proof.hpp"
+#include "d3d9_trace.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include <atomic>
@@ -186,7 +186,7 @@ D3D9Interface::CheckDeviceFormatConversion(UINT Adapter, D3DDEVTYPE DevType, D3D
 HRESULT STDMETHODCALLTYPE
 D3D9Interface::GetDeviceCaps(UINT Adapter, D3DDEVTYPE DevType, D3DCAPS9 *pCaps) {
   if (!pCaps) return D3DERR_INVALIDCALL;
-  d3d9_proof("GetDeviceCaps", ((long)Adapter<<8)|DevType);
+  D3D9_TRACE("GetDeviceCaps adapter=", Adapter, " devType=", DevType);
   if (Adapter != 0 || DevType != D3DDEVTYPE_HAL) return D3DERR_INVALIDCALL;
   FillD3D9Caps(pCaps);
   return D3D_OK;
@@ -210,13 +210,14 @@ D3D9Interface::CreateDevice(
     DWORD BehaviorFlags, D3DPRESENT_PARAMETERS *pPP,
     IDirect3DDevice9 **ppDevice) {
 
-  d3d9_proof("CreateDevice: enter", ((long)Adapter<<8)|DeviceType);
+  D3D9_TRACE("CreateDevice adapter=", Adapter, " devType=", DeviceType,
+             " flags=0x", std::hex, BehaviorFlags);
   if (!ppDevice || !pPP) return D3DERR_INVALIDCALL;
   if (Adapter != 0 || DeviceType != D3DDEVTYPE_HAL) return D3DERR_INVALIDCALL;
 
   auto device = new D3D9Device(this, dxgi_adapter_.ptr(), hFocusWindow, BehaviorFlags, pPP, false);
   HRESULT hr = device->Initialize();
-  d3d9_proof("CreateDevice: Initialize returned", hr);
+  D3D9_TRACE("CreateDevice Initialize hr=0x", std::hex, hr);
   if (FAILED(hr)) { device->Release(); return hr; }
 
   *ppDevice = device;

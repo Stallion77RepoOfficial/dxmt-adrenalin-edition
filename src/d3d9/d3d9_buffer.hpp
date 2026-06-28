@@ -1,98 +1,85 @@
 #pragma once
 
+#include "d3d9_private.h"
 #include "com/com_object.hpp"
-#include "com/com_pointer.hpp"
-#include "d3d9.h"
-#include "d3d11.h"
+#include <vector>
 
-namespace dxmt::d3d9 {
+namespace dxmt {
 
 class D3D9Device;
 
-class D3D9VertexBuffer final : public ComObjectWithInitialRef<IDirect3DVertexBuffer9> {
+// Common implementation for IDirect3DVertexBuffer9 / IDirect3DIndexBuffer9.
+//
+// Every D3D9 buffer keeps a CPU-side shadow copy. Locks hand out a pointer into
+// that shadow (honouring offset/size and the read-only flag); unlocks push the
+// touched range to the backing ID3D11Buffer. This handles all D3DPOOLs and the
+// D3DLOCK_DISCARD / D3DLOCK_NOOVERWRITE hints uniformly: dynamic buffers use
+// Map(WRITE_DISCARD/NO_OVERWRITE), everything else uses UpdateSubresource. The
+// shadow also makes GetData-style read-back and partial locks trivial.
+template <typename Interface, typename DescType>
+class D3D9Buffer : public ComObjectClamp<Interface> {
 public:
-    D3D9VertexBuffer(D3D9Device *pDevice, UINT length, DWORD usage, DWORD fvf, D3DPOOL pool);
-    ~D3D9VertexBuffer();
+  D3D9Buffer(D3D9Device *pDevice, UINT Length, DWORD Usage, D3DPOOL Pool, const DescType &Desc);
 
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override;
-    ULONG   STDMETHODCALLTYPE AddRef() override  { return ComObjectWithInitialRef::AddRef(); }
-    ULONG   STDMETHODCALLTYPE Release() override { return ComObjectWithInitialRef::Release(); }
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) final {
+    if (!ppvObject) return E_POINTER;
+    if (riid == __uuidof(IUnknown) ||
+        riid == __uuidof(IDirect3DResource9) ||
+        riid == __uuidof(Interface)) {
+      *ppvObject = ref(this);
+      return S_OK;
+    }
+    *ppvObject = nullptr;
+    return E_NOINTERFACE;
+  }
 
-    HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice9 **ppDevice) override;
-    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID refguid, const void *pData, DWORD SizeOfData, DWORD Flags) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID refguid, void *pData, DWORD *pSizeOfData) override { return D3DERR_NOTFOUND; }
-    HRESULT STDMETHODCALLTYPE FreePrivateData(REFGUID refguid) override { return D3DERR_NOTFOUND; }
-    DWORD   STDMETHODCALLTYPE SetPriority(DWORD PriorityNew) override { return 0; }
-    DWORD   STDMETHODCALLTYPE GetPriority() override { return 0; }
-    void    STDMETHODCALLTYPE PreLoad() override {}
-    D3DRESOURCETYPE STDMETHODCALLTYPE GetType() override { return D3DRTYPE_VERTEXBUFFER; }
+  // IDirect3DResource9
+  HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice9 **ppDevice) final;
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, const void *, DWORD, DWORD) final { return D3D_OK; }
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, void *, DWORD *) final { return D3DERR_NOTFOUND; }
+  HRESULT STDMETHODCALLTYPE FreePrivateData(REFGUID) final { return D3D_OK; }
+  DWORD   STDMETHODCALLTYPE SetPriority(DWORD Priority) final { DWORD o = priority_; priority_ = Priority; return o; }
+  DWORD   STDMETHODCALLTYPE GetPriority() final { return priority_; }
+  void    STDMETHODCALLTYPE PreLoad() final {}
+  D3DRESOURCETYPE STDMETHODCALLTYPE GetType() final { return desc_.Type; }
 
-    HRESULT STDMETHODCALLTYPE Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWORD Flags) override;
-    HRESULT STDMETHODCALLTYPE Unlock() override;
-    HRESULT STDMETHODCALLTYPE GetDesc(D3DVERTEXBUFFER_DESC *pDesc) override;
+  // IDirect3D{Vertex,Index}Buffer9
+  HRESULT STDMETHODCALLTYPE Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWORD Flags);
+  HRESULT STDMETHODCALLTYPE Unlock();
+  HRESULT STDMETHODCALLTYPE GetDesc(DescType *pDesc) {
+    if (!pDesc) return D3DERR_INVALIDCALL;
+    *pDesc = desc_;
+    return D3D_OK;
+  }
 
-    ID3D11Buffer* GetD3D11Buffer() const { return m_buffer.ptr(); }
-    UINT GetStride() const { return m_stride; }
-    DWORD GetFVF() const { return m_fvf; }
-    UINT GetSize() const { return m_length; }
-    const BYTE* GetData() const { return m_sysMemData.data(); }
+  // Internal accessors used by the device when binding the buffer.
+  ID3D11Buffer *GetD3D11Buffer() const { return buffer_.ptr(); }
+  UINT          Length()        const { return length_; }
 
-    void SetStride(UINT stride) { m_stride = stride; }
+protected:
+  D3D9Device          *device_;
+  Com<ID3D11Buffer>    buffer_;
+  std::vector<uint8_t> shadow_;
+  UINT                 length_;
+  DescType             desc_ = {};
+  DWORD                priority_ = 0;
+  bool                 dynamic_ = false;
 
-private:
-    D3D9Device         *m_device;
-    Com<ID3D11Buffer>   m_buffer;
-    std::vector<BYTE>   m_sysMemData;
-    UINT   m_length;
-    DWORD  m_usage;
-    DWORD  m_fvf;
-    D3DPOOL m_pool;
-    UINT   m_stride = 0;
-    bool   m_locked = false;
-    UINT   m_lockOffset = 0;
-    UINT   m_lockSize = 0;
-    DWORD  m_lockFlags = 0;
-    bool   m_dynamic = false;
+  // Active lock state.
+  UINT  lock_offset_   = 0;
+  UINT  lock_size_     = 0;
+  DWORD lock_flags_    = 0;
+  bool  locked_        = false;
 };
 
-class D3D9IndexBuffer final : public ComObjectWithInitialRef<IDirect3DIndexBuffer9> {
+class D3D9VertexBuffer final : public D3D9Buffer<IDirect3DVertexBuffer9, D3DVERTEXBUFFER_DESC> {
 public:
-    D3D9IndexBuffer(D3D9Device *pDevice, UINT length, DWORD usage, D3DFORMAT format, D3DPOOL pool);
-    ~D3D9IndexBuffer();
-
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override;
-    ULONG   STDMETHODCALLTYPE AddRef() override  { return ComObjectWithInitialRef::AddRef(); }
-    ULONG   STDMETHODCALLTYPE Release() override { return ComObjectWithInitialRef::Release(); }
-
-    HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice9 **ppDevice) override;
-    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID refguid, const void *pData, DWORD SizeOfData, DWORD Flags) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID refguid, void *pData, DWORD *pSizeOfData) override { return D3DERR_NOTFOUND; }
-    HRESULT STDMETHODCALLTYPE FreePrivateData(REFGUID refguid) override { return D3DERR_NOTFOUND; }
-    DWORD   STDMETHODCALLTYPE SetPriority(DWORD PriorityNew) override { return 0; }
-    DWORD   STDMETHODCALLTYPE GetPriority() override { return 0; }
-    void    STDMETHODCALLTYPE PreLoad() override {}
-    D3DRESOURCETYPE STDMETHODCALLTYPE GetType() override { return D3DRTYPE_INDEXBUFFER; }
-
-    HRESULT STDMETHODCALLTYPE Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWORD Flags) override;
-    HRESULT STDMETHODCALLTYPE Unlock() override;
-    HRESULT STDMETHODCALLTYPE GetDesc(D3DINDEXBUFFER_DESC *pDesc) override;
-
-    ID3D11Buffer* GetD3D11Buffer() const { return m_buffer.ptr(); }
-    DXGI_FORMAT GetFormat() const;
-    UINT GetSize() const { return m_length; }
-    D3DFORMAT GetD3D9Format() const { return m_format; }
-    const BYTE* GetData() const { return m_sysMemData.data(); }
-
-private:
-    D3D9Device         *m_device;
-    Com<ID3D11Buffer>   m_buffer;
-    std::vector<BYTE>   m_sysMemData;
-    UINT      m_length;
-    DWORD     m_usage;
-    D3DFORMAT m_format;
-    D3DPOOL   m_pool;
-    bool      m_locked = false;
-    bool      m_dynamic = false;
+  using D3D9Buffer::D3D9Buffer;
 };
 
-} // namespace dxmt::d3d9
+class D3D9IndexBuffer final : public D3D9Buffer<IDirect3DIndexBuffer9, D3DINDEXBUFFER_DESC> {
+public:
+  using D3D9Buffer::D3D9Buffer;
+};
+
+} // namespace dxmt

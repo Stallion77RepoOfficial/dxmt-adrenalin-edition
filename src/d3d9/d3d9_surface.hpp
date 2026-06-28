@@ -1,67 +1,103 @@
 #pragma once
 
+#include "d3d9_private.h"
+#include "d3d9_format.hpp"
 #include "com/com_object.hpp"
-#include "com/com_pointer.hpp"
-#include "d3d9.h"
-#include "d3d11.h"
-#include <vector>
 
-namespace dxmt::d3d9 {
+namespace dxmt {
 
 class D3D9Device;
 
-class D3D9Surface final : public ComObjectWithInitialRef<IDirect3DSurface9> {
+// IDirect3DSurface9 backed by a single subresource of an ID3D11Texture2D.
+//
+// A surface may either own its D3D11 texture (render targets, depth buffers,
+// offscreen plain surfaces, wrapped back buffers) or reference a subresource
+// of a texture it belongs to (mip level / cube face of a D3D9 texture). In the
+// latter case `container_` keeps the owning resource alive.
+class D3D9Surface final : public ComObjectClamp<IDirect3DSurface9> {
 public:
-    D3D9Surface(D3D9Device *pDevice, ID3D11Texture2D *pTexture, UINT mipLevel, UINT arraySlice,
-                D3DFORMAT fmt, DWORD usage);
-    D3D9Surface(D3D9Device *pDevice, UINT width, UINT height, D3DFORMAT fmt, DWORD usage,
-                D3DPOOL pool, bool lockable);
-    ~D3D9Surface();
+  D3D9Surface(
+      D3D9Device      *pDevice,
+      ID3D11Texture2D *pTexture,
+      UINT             Subresource,
+      D3DPOOL          Pool,
+      DWORD            Usage,
+      D3DFORMAT        Format,
+      IUnknown        *pContainer = nullptr)
+      : device_(pDevice),
+        texture_(pTexture),
+        subresource_(Subresource),
+        container_(pContainer) {
+    D3D11_TEXTURE2D_DESC td = {};
+    texture_->GetDesc(&td);
+    desc_.Format            = Format;
+    desc_.Type              = D3DRTYPE_SURFACE;
+    desc_.Usage             = Usage;
+    desc_.Pool              = Pool;
+    desc_.MultiSampleType   = (D3DMULTISAMPLE_TYPE)td.SampleDesc.Count;
+    desc_.MultiSampleQuality= td.SampleDesc.Quality;
+    UINT mip = Subresource % (td.MipLevels ? td.MipLevels : 1);
+    desc_.Width             = td.Width  >> mip ? td.Width  >> mip : 1;
+    desc_.Height            = td.Height >> mip ? td.Height >> mip : 1;
+  }
 
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) override;
-    ULONG   STDMETHODCALLTYPE AddRef() override  { return ComObjectWithInitialRef::AddRef(); }
-    ULONG   STDMETHODCALLTYPE Release() override { return ComObjectWithInitialRef::Release(); }
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) final {
+    if (!ppvObject) return E_POINTER;
+    if (riid == __uuidof(IUnknown) ||
+        riid == __uuidof(IDirect3DResource9) ||
+        riid == __uuidof(IDirect3DSurface9)) {
+      *ppvObject = ref(this);
+      return S_OK;
+    }
+    *ppvObject = nullptr;
+    return E_NOINTERFACE;
+  }
 
-    // IDirect3DResource9
-    HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice9 **ppDevice) override;
-    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID refguid, const void *pData, DWORD SizeOfData, DWORD Flags) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID refguid, void *pData, DWORD *pSizeOfData) override { return D3DERR_NOTFOUND; }
-    HRESULT STDMETHODCALLTYPE FreePrivateData(REFGUID refguid) override { return D3DERR_NOTFOUND; }
-    DWORD   STDMETHODCALLTYPE SetPriority(DWORD PriorityNew) override { return 0; }
-    DWORD   STDMETHODCALLTYPE GetPriority() override { return 0; }
-    void    STDMETHODCALLTYPE PreLoad() override {}
-    D3DRESOURCETYPE STDMETHODCALLTYPE GetType() override { return D3DRTYPE_SURFACE; }
+  // IDirect3DResource9
+  HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice9 **ppDevice) final;
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, const void *, DWORD, DWORD) final { return D3D_OK; }
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, void *, DWORD *) final { return D3DERR_NOTFOUND; }
+  HRESULT STDMETHODCALLTYPE FreePrivateData(REFGUID) final { return D3D_OK; }
+  DWORD   STDMETHODCALLTYPE SetPriority(DWORD Priority) final { DWORD o = priority_; priority_ = Priority; return o; }
+  DWORD   STDMETHODCALLTYPE GetPriority() final { return priority_; }
+  void    STDMETHODCALLTYPE PreLoad() final {}
+  D3DRESOURCETYPE STDMETHODCALLTYPE GetType() final { return D3DRTYPE_SURFACE; }
 
-    // IDirect3DSurface9
-    HRESULT STDMETHODCALLTYPE GetContainer(REFIID riid, void **ppContainer) override;
-    HRESULT STDMETHODCALLTYPE GetDesc(D3DSURFACE_DESC *pDesc) override;
-    HRESULT STDMETHODCALLTYPE LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD Flags) override;
-    HRESULT STDMETHODCALLTYPE UnlockRect() override;
-    HRESULT STDMETHODCALLTYPE GetDC(HDC *phdc) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE ReleaseDC(HDC hdc) override { return E_NOTIMPL; }
+  // IDirect3DSurface9
+  HRESULT STDMETHODCALLTYPE GetContainer(REFIID riid, void **ppContainer) final {
+    if (container_) return container_->QueryInterface(riid, ppContainer);
+    return GetDevice(reinterpret_cast<IDirect3DDevice9 **>(ppContainer));
+  }
+  HRESULT STDMETHODCALLTYPE GetDesc(D3DSURFACE_DESC *pDesc) final {
+    if (!pDesc) return D3DERR_INVALIDCALL;
+    *pDesc = desc_;
+    return D3D_OK;
+  }
+  HRESULT STDMETHODCALLTYPE LockRect(D3DLOCKED_RECT *pLockedRect, const RECT *pRect, DWORD Flags) final;
+  HRESULT STDMETHODCALLTYPE UnlockRect() final;
+  HRESULT STDMETHODCALLTYPE GetDC(HDC *) final { return D3DERR_INVALIDCALL; }
+  HRESULT STDMETHODCALLTYPE ReleaseDC(HDC) final { return D3DERR_INVALIDCALL; }
 
-    ID3D11Texture2D* GetD3D11Texture() const { return m_texture.ptr(); }
-    ID3D11RenderTargetView* GetRTV() const { return m_rtv.ptr(); }
-    ID3D11DepthStencilView* GetDSV() const { return m_dsv.ptr(); }
-    ID3D11ShaderResourceView* GetSRV() const { return m_srv.ptr(); }
-    UINT GetMipLevel() const { return m_mipLevel; }
-    UINT GetArraySlice() const { return m_arraySlice; }
-    D3DFORMAT GetFormat() const { return m_desc.Format; }
+  // Internal accessors
+  ID3D11Texture2D *GetD3D11Texture() const { return texture_.ptr(); }
+  UINT             GetSubresource()  const { return subresource_; }
+  const D3DSURFACE_DESC &Desc()      const { return desc_; }
 
-    void SetContainer(IUnknown *pContainer) { m_container = pContainer; }
+  ID3D11RenderTargetView *GetRTV();
+  ID3D11DepthStencilView *GetDSV();
 
 private:
-    D3D9Device        *m_device;
-    Com<ID3D11Texture2D>        m_texture;
-    Com<ID3D11RenderTargetView> m_rtv;
-    Com<ID3D11DepthStencilView> m_dsv;
-    Com<ID3D11ShaderResourceView> m_srv;
-    IUnknown          *m_container = nullptr;
-    D3DSURFACE_DESC    m_desc;
-    UINT               m_mipLevel;
-    UINT               m_arraySlice;
-    std::vector<BYTE>  m_sysMemData;
-    bool               m_ownTexture = false;
+  D3D9Device              *device_;
+  Com<ID3D11Texture2D>     texture_;
+  UINT                     subresource_;
+  IUnknown                *container_; // not owned; surfaces of a texture borrow its lifetime via private ref
+  D3DSURFACE_DESC          desc_ = {};
+  DWORD                    priority_ = 0;
+
+  Com<ID3D11RenderTargetView> rtv_;
+  Com<ID3D11DepthStencilView> dsv_;
+  Com<ID3D11Texture2D>        lock_staging_; // staging copy used by LockRect
+  bool                        lock_readonly_ = false;
 };
 
-} // namespace dxmt::d3d9
+} // namespace dxmt
