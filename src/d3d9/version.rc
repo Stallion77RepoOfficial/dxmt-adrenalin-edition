@@ -1,8 +1,8 @@
 #include <windows.h>
 
 VS_VERSION_INFO    VERSIONINFO
-FILEVERSION        9,0,0,0
-PRODUCTVERSION     9,0,0,0
+FILEVERSION        9,29,1974,0
+PRODUCTVERSION     9,29,1974,0
 FILEFLAGSMASK      VS_FFI_FILEFLAGSMASK
 FILEFLAGS          0
 FILEOS VOS_NT_WINDOWS32
@@ -15,12 +15,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName",      "DXMT"
       VALUE "FileDescription",  "Direct3D 9 Runtime"
-      VALUE "FileVersion",      "9.0.0.0"
+      VALUE "FileVersion",      "9.29.1974.0"
       VALUE "InternalName",     "D3D9.dll"
       VALUE "LegalCopyright",   "MIT License"
       VALUE "OriginalFilename", "D3D9.dll"
       VALUE "ProductName",      "DXMT"
-      VALUE "ProductVersion",   "9.0.0.0"
+      VALUE "ProductVersion",   "9.29.1974.0"
     END
   END
   BLOCK "VarFileInfo"

@@ -1,21 +1,28 @@
 d3d9_res = wrc_generator.process('version.rc')
 
 d3d9_src = [
+  'd3d9.cpp',
   'd3d9_main.cpp',
-  'd3d9_interface.cpp',
   'd3d9_device.cpp',
   'd3d9_surface.cpp',
-  'd3d9_buffer.cpp',
   'd3d9_texture.cpp',
+  'd3d9_buffer.cpp',
+  'd3d9_shader.cpp',
+  'sm3_to_sm4.cpp',
 ]
 
 d3d9_ld_args      = ['-L' + windows_native_install_dir]
 d3d9_link_depends = []
 
+d3d9_native_inc = include_directories(
+  '../../../include/native/directx',
+  '../../../include/native/windows',
+)
+
 d3d9_dll = shared_library('d3d9', d3d9_src, d3d9_res,
   name_prefix         : '',
-  dependencies        : [ d3d11_dep, dxgi_dep, dxmt_dep, winemetal_dep, util_dep ],
-  include_directories : [ dxmt_include_path ],
+  dependencies        : [ d3d11_dep, dxgi_dep, util_dep ],
+  include_directories : [ dxmt_include_path, d3d9_native_inc ],
   install             : true,
   install_dir         : windows_native_install_dir,
   vs_module_defs      : 'd3d9.def',
