@@ -1,4 +1,5 @@
 #include "dxbc_converter.hpp"
+#include <cstdio>
 #include "DXBCParser/BlobContainer.h"
 #include "DXBCParser/ShaderBinary.h"
 #include "airconv_error.hpp"
@@ -381,8 +382,14 @@ void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_v
   auto airLangVersion = module.getOrInsertNamedMetadata("air.language_version");
   switch (metal_version) {
   case SM50_SHADER_METAL_320: {
+    // air.version 2.8 (not 2.7): macOS 26's AGX driver cannot "upgrade" air 2.7
+    // function bitcode and fails every PSO. air 2.8 paired with Metal language
+    // 3.2 is what the system's own Metal frontend emits and the driver accepts.
+    // Must be assembled via air-as (see metallib_writer) so the bitcode is in
+    // the legacy container format; LLVM 22's own bitcode writer crashes the
+    // driver's compiler regardless of the declared air version.
     airVersion->addOperand(
-        MDTuple::get(context, {createUnsignedInteger(2), createUnsignedInteger(7), createUnsignedInteger(0)})
+        MDTuple::get(context, {createUnsignedInteger(2), createUnsignedInteger(8), createUnsignedInteger(0)})
     );
     airLangVersion->addOperand(MDTuple::get(
         context, {createString("Metal"), createUnsignedInteger(3), createUnsignedInteger(2), createUnsignedInteger(0)}
@@ -1394,6 +1401,9 @@ AIRCONV_API int SM50Compile(
 ) {
   using namespace llvm;
   using namespace dxmt;
+
+  { FILE *f = fopen("/Users/Shared/dxmt_sm50.log", "a");
+    if (f) { fprintf(f, "SM50Compile entered: fn=%s\n", FunctionName ? FunctionName : "(null)"); fclose(f); } }
 
   if (ppError) {
     *ppError = nullptr;

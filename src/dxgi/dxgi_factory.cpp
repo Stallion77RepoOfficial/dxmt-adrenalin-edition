@@ -7,6 +7,7 @@
 #include "util_string.hpp"
 #include "wsi_window.hpp"
 #include "Metal.hpp"
+#include "util_env.hpp"
 
 namespace dxmt {
 
@@ -16,7 +17,15 @@ Com<IMTLDXGIAdapter> CreateAdapter(WMT::Device Device,
 class MTLDXGIFactory : public MTLDXGIObject<IDXGIFactory6> {
 
 public:
-  MTLDXGIFactory(UINT Flags) : flags_(Flags) {};
+  MTLDXGIFactory(UINT Flags) : flags_(Flags) {
+    // Bridge DXMT_HUD (read here from the reliable Windows-side environment) to
+    // the unix-side MTLHUDEnabled before any Metal device is created. The
+    // unix-side constructor reads getenv directly, which under CrossOver does
+    // not always see the variable; this guarantees the Metal HUD turns on.
+    auto hud = env::getEnvVar("DXMT_HUD");
+    if (!hud.empty() && hud != "0")
+      WMT::EnableDeveloperHUD();
+  };
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
                                            void **ppvObject) final {

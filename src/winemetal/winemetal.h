@@ -1648,6 +1648,12 @@ WINEMETAL_API obj_handle_t NSString_string(const char *data, enum WMTStringEncod
 
 WINEMETAL_API obj_handle_t NSString_alloc_init(const char *data, enum WMTStringEncoding encoding);
 
+// Forces Apple's Metal Performance HUD on by setting MTLHUDEnabled in the unix
+// process environment, used when DXMT_HUD is requested but only visible to the
+// Windows-side environment (e.g. under CrossOver). Must be called before the
+// Metal device is created (i.e. before CopyAllDevices).
+WINEMETAL_API void WMTEnableDeveloperHUD();
+
 WINEMETAL_API obj_handle_t DeveloperHUDProperties_instance();
 
 WINEMETAL_API bool DeveloperHUDProperties_addLabel(obj_handle_t obj, obj_handle_t label, obj_handle_t after);
