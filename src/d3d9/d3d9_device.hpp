@@ -259,6 +259,7 @@ public:
 
     void FlushRenderStates();
     void FlushSamplerStates();
+    void FlushShaders();
     void FlushInputLayout(D3DPRIMITIVETYPE primType);
     void FlushConstantBuffers();
     void UploadBufferToGPU(class D3D9VertexBuffer *vb);
@@ -267,6 +268,7 @@ public:
 private:
     void CreateDefaultInputLayout();
     void BuildInputLayoutFromDecl(D3D9VertexDeclaration *decl, const void *vsBytecode, size_t vsSize, ID3D11InputLayout **ppLayout);
+    void BuildInputLayoutFromFVF(DWORD fvf, const void *vsBytecode, size_t vsSize, ID3D11InputLayout **ppLayout);
     void UpdateBlendState();
     void UpdateDepthStencilState();
     void UpdateRasterizerState();

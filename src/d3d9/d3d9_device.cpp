@@ -806,6 +806,146 @@ HRESULT STDMETHODCALLTYPE D3D9Device::CreateQuery(D3DQUERYTYPE Type, IDirect3DQu
 // State flush helpers
 // ---------------------------------------------------------------------------
 
+static const char *DeclusageSemantic(BYTE usage) {
+    switch (usage) {
+    case 0:  return "POSITION";
+    case 1:  return "BLENDWEIGHT";
+    case 2:  return "BLENDINDICES";
+    case 3:  return "NORMAL";
+    case 4:  return "PSIZE";
+    case 5:  return "TEXCOORD";
+    case 6:  return "TANGENT";
+    case 7:  return "BINORMAL";
+    case 8:  return "TESSFACTOR";
+    case 9:  return "POSITIONT";
+    case 10: return "COLOR";
+    case 11: return "FOG";
+    default: return "TEXCOORD";
+    }
+}
+
+static DXGI_FORMAT DeclTypeToDxgi(BYTE type) {
+    switch (type) {
+    case 0:  return DXGI_FORMAT_R32_FLOAT;           // FLOAT1
+    case 1:  return DXGI_FORMAT_R32G32_FLOAT;        // FLOAT2
+    case 2:  return DXGI_FORMAT_R32G32B32_FLOAT;     // FLOAT3
+    case 3:  return DXGI_FORMAT_R32G32B32A32_FLOAT;  // FLOAT4
+    case 4:  return DXGI_FORMAT_B8G8R8A8_UNORM;      // D3DCOLOR
+    case 5:  return DXGI_FORMAT_R8G8B8A8_UINT;       // UBYTE4
+    case 6:  return DXGI_FORMAT_R16G16_SINT;         // SHORT2
+    case 7:  return DXGI_FORMAT_R16G16B16A16_SINT;   // SHORT4
+    case 8:  return DXGI_FORMAT_R8G8B8A8_UNORM;      // UBYTE4N
+    case 9:  return DXGI_FORMAT_R16G16_SNORM;        // SHORT2N
+    case 10: return DXGI_FORMAT_R16G16B16A16_SNORM;  // SHORT4N
+    case 11: return DXGI_FORMAT_R16G16_UNORM;        // USHORT2N
+    case 12: return DXGI_FORMAT_R16G16B16A16_UNORM;  // USHORT4N
+    case 13: return DXGI_FORMAT_R10G10B10A2_UINT;    // UDEC3 (approx)
+    case 14: return DXGI_FORMAT_R10G10B10A2_UNORM;   // DEC3N (approx)
+    case 15: return DXGI_FORMAT_R16G16_FLOAT;        // FLOAT16_2
+    case 16: return DXGI_FORMAT_R16G16B16A16_FLOAT;  // FLOAT16_4
+    default: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    }
+}
+
+void D3D9Device::BuildInputLayoutFromDecl(D3D9VertexDeclaration *decl,
+                                           const void *vsBytecode, size_t vsSize,
+                                           ID3D11InputLayout **ppLayout) {
+    if (!decl || !vsBytecode || !vsSize) { *ppLayout = nullptr; return; }
+
+    const auto &elems = decl->GetElements();
+    std::vector<D3D11_INPUT_ELEMENT_DESC> d3d11elems;
+
+    for (auto &e : elems) {
+        if (e.Stream == 0xFF) break;  // D3DDECL_END
+        if (e.Type == 17) continue;   // D3DDECLTYPE_UNUSED
+        D3D11_INPUT_ELEMENT_DESC desc = {};
+        desc.SemanticName         = DeclusageSemantic(e.Usage);
+        desc.SemanticIndex        = e.UsageIndex;
+        desc.Format               = DeclTypeToDxgi(e.Type);
+        desc.InputSlot            = e.Stream;
+        desc.AlignedByteOffset    = e.Offset;
+        desc.InputSlotClass       = D3D11_INPUT_PER_VERTEX_DATA;
+        desc.InstanceDataStepRate = 0;
+        d3d11elems.push_back(desc);
+    }
+
+    if (d3d11elems.empty()) { *ppLayout = nullptr; return; }
+
+    Com<ID3D11InputLayout> layout;
+    m_d3d11Device->CreateInputLayout(d3d11elems.data(), (UINT)d3d11elems.size(),
+                                      vsBytecode, vsSize, &layout);
+    *ppLayout = layout.ref();
+}
+
+void D3D9Device::BuildInputLayoutFromFVF(DWORD fvf, const void *vsBytecode, size_t vsSize,
+                                          ID3D11InputLayout **ppLayout) {
+    if (!vsBytecode || !vsSize) { *ppLayout = nullptr; return; }
+
+    std::vector<D3D11_INPUT_ELEMENT_DESC> elems;
+    UINT offset = 0;
+
+    auto addElem = [&](const char *sem, UINT semIdx, DXGI_FORMAT fmt, UINT slot = 0) {
+        D3D11_INPUT_ELEMENT_DESC e = {};
+        e.SemanticName         = sem;
+        e.SemanticIndex        = semIdx;
+        e.Format               = fmt;
+        e.InputSlot            = slot;
+        e.AlignedByteOffset    = offset;
+        e.InputSlotClass       = D3D11_INPUT_PER_VERTEX_DATA;
+        e.InstanceDataStepRate = 0;
+        elems.push_back(e);
+        UINT sz = 0;
+        switch (fmt) {
+        case DXGI_FORMAT_R32_FLOAT:          sz = 4; break;
+        case DXGI_FORMAT_R32G32_FLOAT:       sz = 8; break;
+        case DXGI_FORMAT_R32G32B32_FLOAT:    sz = 12; break;
+        case DXGI_FORMAT_R32G32B32A32_FLOAT: sz = 16; break;
+        case DXGI_FORMAT_B8G8R8A8_UNORM:     sz = 4; break;
+        default:                             sz = 4; break;
+        }
+        offset += sz;
+    };
+
+    // Bit 1 = XYZ (3 floats), Bit 2 = RHW (1 float), Bit 8 = XYZ + RHW
+    bool hasXYZ    = (fvf & 0x002) != 0;
+    bool hasXYZRHW = (fvf & 0x004) != 0;
+    bool hasXYZW   = (fvf & 0x008) != 0;
+    bool hasNormal = (fvf & 0x010) != 0;
+    bool hasPSize  = (fvf & 0x020) != 0;
+    bool hasDiff   = (fvf & 0x040) != 0;
+    bool hasSpec   = (fvf & 0x080) != 0;
+    UINT numTex    = (fvf >> 8) & 0xF;
+
+    if (hasXYZ)    addElem("POSITION",  0, DXGI_FORMAT_R32G32B32_FLOAT);
+    if (hasXYZRHW) addElem("POSITIONT", 0, DXGI_FORMAT_R32G32B32A32_FLOAT);
+    if (hasXYZW)   addElem("POSITION",  0, DXGI_FORMAT_R32G32B32A32_FLOAT);
+    if (hasNormal)  addElem("NORMAL",   0, DXGI_FORMAT_R32G32B32_FLOAT);
+    if (hasPSize)   addElem("PSIZE",    0, DXGI_FORMAT_R32_FLOAT);
+    if (hasDiff)    addElem("COLOR",    0, DXGI_FORMAT_B8G8R8A8_UNORM);
+    if (hasSpec)    addElem("COLOR",    1, DXGI_FORMAT_B8G8R8A8_UNORM);
+
+    // Texture coordinate sizes (2 bits per tex: 00=2D, 01=3D, 10=4D, 11=1D)
+    DWORD texFmts = fvf >> 16;
+    for (UINT i = 0; i < numTex; i++) {
+        UINT dim = (texFmts >> (i * 2)) & 0x3;
+        DXGI_FORMAT fmt;
+        switch (dim) {
+        case 1:  fmt = DXGI_FORMAT_R32G32B32_FLOAT;    break; // 3D
+        case 2:  fmt = DXGI_FORMAT_R32G32B32A32_FLOAT; break; // 4D
+        case 3:  fmt = DXGI_FORMAT_R32_FLOAT;          break; // 1D
+        default: fmt = DXGI_FORMAT_R32G32_FLOAT;       break; // 2D
+        }
+        addElem("TEXCOORD", i, fmt);
+    }
+
+    if (elems.empty()) { *ppLayout = nullptr; return; }
+
+    Com<ID3D11InputLayout> layout;
+    m_d3d11Device->CreateInputLayout(elems.data(), (UINT)elems.size(),
+                                      vsBytecode, vsSize, &layout);
+    *ppLayout = layout.ref();
+}
+
 void D3D9Device::UpdateBlendState() {
     D3D11_BLEND_DESC desc = {};
     desc.AlphaToCoverageEnable  = FALSE;
@@ -934,6 +1074,35 @@ void D3D9Device::FlushRenderStates() {
     }
 }
 
+void D3D9Device::FlushShaders() {
+    if (m_vertexShader && m_vertexShader->GetD3D11Shader()) {
+        m_d3d11Context->VSSetShader(m_vertexShader->GetD3D11Shader(), nullptr, 0);
+    } else {
+        m_d3d11Context->VSSetShader(nullptr, nullptr, 0);
+    }
+    if (m_pixelShader && m_pixelShader->GetD3D11Shader()) {
+        m_d3d11Context->PSSetShader(m_pixelShader->GetD3D11Shader(), nullptr, 0);
+    } else {
+        m_d3d11Context->PSSetShader(nullptr, nullptr, 0);
+    }
+
+    // Rebuild input layout when shaders change
+    if (m_vertexShader && !m_vertexShader->GetBytecode().empty()) {
+        const auto &bc = m_vertexShader->GetBytecode();
+        ID3D11InputLayout *rawLayout = nullptr;
+        if (m_vertexDecl) {
+            BuildInputLayoutFromDecl(m_vertexDecl.ptr(), bc.data(), bc.size(), &rawLayout);
+        } else if (m_fvf) {
+            BuildInputLayoutFromFVF(m_fvf, bc.data(), bc.size(), &rawLayout);
+        }
+        if (rawLayout) {
+            m_inputLayout = rawLayout;
+            rawLayout->Release(); // layout.ref() in callee already AddRef'd; Com::operator= AddRefs again
+            m_d3d11Context->IASetInputLayout(m_inputLayout.ptr());
+        }
+    }
+}
+
 void D3D9Device::FlushSamplerStates() {
     for (UINT i = 0; i < kMaxSamplers; i++) {
         if (m_samplerStates[i].dirty)
@@ -1008,6 +1177,7 @@ void D3D9Device::FlushInputLayout(D3DPRIMITIVETYPE primType) {
 HRESULT STDMETHODCALLTYPE D3D9Device::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount) {
     FlushRenderStates();
     FlushSamplerStates();
+    FlushShaders();
     FlushConstantBuffers();
     FlushInputLayout(PrimitiveType);
     UINT vertexCount = PrimCountToVertexCount(PrimitiveType, PrimitiveCount);
@@ -1018,6 +1188,7 @@ HRESULT STDMETHODCALLTYPE D3D9Device::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveTy
 HRESULT STDMETHODCALLTYPE D3D9Device::DrawIndexedPrimitive(D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT startIndex, UINT primCount) {
     FlushRenderStates();
     FlushSamplerStates();
+    FlushShaders();
     FlushConstantBuffers();
     FlushInputLayout(PrimitiveType);
     UINT indexCount = PrimCountToVertexCount(PrimitiveType, primCount);
@@ -1052,6 +1223,7 @@ HRESULT STDMETHODCALLTYPE D3D9Device::DrawPrimitiveUP(D3DPRIMITIVETYPE Primitive
 
     FlushRenderStates();
     FlushSamplerStates();
+    FlushShaders();
     FlushConstantBuffers();
     m_d3d11Context->Draw(vertexCount, 0);
     return D3D_OK;
@@ -1093,6 +1265,7 @@ HRESULT STDMETHODCALLTYPE D3D9Device::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE Pr
 
     FlushRenderStates();
     FlushSamplerStates();
+    FlushShaders();
     FlushConstantBuffers();
     m_d3d11Context->DrawIndexed(indexCount, 0, 0);
     return D3D_OK;

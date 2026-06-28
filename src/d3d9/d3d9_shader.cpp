@@ -1,42 +1,12 @@
 #include "d3d9_shader.hpp"
 #include "d3d9_device.hpp"
 #include "d3d9_format.hpp"
+#include "sm3_to_sm4.hpp"
 #include "log/log.hpp"
+#include "util_string.hpp"
 #include <cstring>
 
 namespace dxmt::d3d9 {
-
-// ---------------------------------------------------------------------------
-// Minimal D3D9 SM3 → SM4 DXBC shader conversion utilities
-// ---------------------------------------------------------------------------
-
-static UINT GetShaderSize(const DWORD *func) {
-    if (!func) return 0;
-    const DWORD *ptr = func;
-    while (*ptr != 0x0000FFFF) ptr++; // D3D9 END token
-    return (UINT)((ptr - func + 1) * sizeof(DWORD));
-}
-
-// Very basic SM4 DXBC wrapper: treat SM2/SM3 bytecode as passthrough
-// For a full implementation a proper shader transpiler would be needed.
-// This minimal implementation creates a stub that returns (0,0,0,1) to prevent
-// crashes from missing shaders, which is better than a nullptr dereference.
-static void CreatePassthroughVS(std::vector<BYTE> &bytecode) {
-    // Hardcoded minimal SM4 vertex shader that passes position through
-    // and outputs (0,0,0,1) as color. Generated with fxc.
-    static const BYTE kMinimalVS[] = {
-        // DXBC signature for a passthrough VS
-        0x44, 0x58, 0x42, 0x43, // "DXBC"
-        // ... minimal vertex shader binary would go here
-        // For now we use D3DCompile or fall back gracefully
-    };
-    // We return empty to signal "use fixed function fallback"
-    bytecode.clear();
-}
-
-static void CreatePassthroughPS(std::vector<BYTE> &bytecode) {
-    bytecode.clear();
-}
 
 // ---------------------------------------------------------------------------
 // D3D9VertexShader
@@ -44,11 +14,26 @@ static void CreatePassthroughPS(std::vector<BYTE> &bytecode) {
 
 D3D9VertexShader::D3D9VertexShader(D3D9Device *pDevice, const DWORD *pFunction, UINT size)
     : m_device(pDevice) {
-    if (pFunction && size) {
-        m_function.assign(pFunction, pFunction + size / sizeof(DWORD));
+    if (!pFunction || !size) return;
+
+    m_function.assign(pFunction, pFunction + size / sizeof(DWORD));
+
+    // Convert SM3 bytecode to SM4 DXBC
+    size_t dwCount = size / sizeof(DWORD);
+    m_bytecode = ConvertSM3ToDXBC(reinterpret_cast<const uint32_t*>(pFunction), dwCount);
+
+    if (m_bytecode.empty()) {
+        Logger::warn("D3D9VertexShader: SM3→SM4 conversion produced empty bytecode");
+        return;
     }
-    // Shader compilation from D3D9 bytecode to D3D11 requires a full transpiler.
-    // The device will handle this when the shader is set.
+
+    // Create D3D11 vertex shader from converted bytecode
+    HRESULT hr = pDevice->GetD3D11Device()->CreateVertexShader(
+        m_bytecode.data(), m_bytecode.size(), nullptr, &m_shader);
+    if (FAILED(hr)) {
+        Logger::warn(str::format("D3D9VertexShader: CreateVertexShader failed hr=", hr));
+        m_bytecode.clear();
+    }
 }
 
 D3D9VertexShader::~D3D9VertexShader() {}
@@ -89,8 +74,23 @@ HRESULT STDMETHODCALLTYPE D3D9VertexShader::GetFunction(void *pData, UINT *pSize
 
 D3D9PixelShader::D3D9PixelShader(D3D9Device *pDevice, const DWORD *pFunction, UINT size)
     : m_device(pDevice) {
-    if (pFunction && size) {
-        m_function.assign(pFunction, pFunction + size / sizeof(DWORD));
+    if (!pFunction || !size) return;
+
+    m_function.assign(pFunction, pFunction + size / sizeof(DWORD));
+
+    size_t dwCount = size / sizeof(DWORD);
+    m_bytecode = ConvertSM3ToDXBC(reinterpret_cast<const uint32_t*>(pFunction), dwCount);
+
+    if (m_bytecode.empty()) {
+        Logger::warn("D3D9PixelShader: SM3→SM4 conversion produced empty bytecode");
+        return;
+    }
+
+    HRESULT hr = pDevice->GetD3D11Device()->CreatePixelShader(
+        m_bytecode.data(), m_bytecode.size(), nullptr, &m_shader);
+    if (FAILED(hr)) {
+        Logger::warn(str::format("D3D9PixelShader: CreatePixelShader failed hr=", hr));
+        m_bytecode.clear();
     }
 }
 

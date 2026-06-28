@@ -8,6 +8,7 @@ d3d9_src = [
   'd3d9_texture.cpp',
   'd3d9_buffer.cpp',
   'd3d9_shader.cpp',
+  'sm3_to_sm4.cpp',
 ]
 
 d3d9_ld_args      = ['-L' + windows_native_install_dir]
