@@ -637,7 +637,6 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   GetFrameStatistics(DXGI_FRAME_STATISTICS *stats) final {
-    DEBUG("DXGISwapChain::GetFrameStatistics: stub");
     std::unique_lock<d3d11_device_mutex> lock(device_->mutex);
     stats->PresentCount = presentation_count_;
     stats->SyncRefreshCount = presentation_count_;

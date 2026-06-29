@@ -1,10 +1,13 @@
 #include "metallib_writer.hpp"
+#include "air_compat_text_writer.hpp"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/PrintPasses.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
+#include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -20,9 +23,15 @@ template <typename T> std::string_view value(const T &value) {
   return std::string_view((const char *)(&value), sizeof(T));
 };
 
-// File-based diagnostic log: the unix-side stderr is not captured by the
-// cxlog, so we append to a known file instead.
+static bool debugDumpEnabled() {
+  return getenv("DXMT_AIR_DEBUG_DUMP") != nullptr;
+}
+
+// File-based diagnostics are only emitted when shader debug dumps are enabled.
 static void airlog(const char *fmt, ...) {
+  if (!debugDumpEnabled())
+    return;
+
   char msg[2048];
   va_list ap;
   va_start(ap, fmt);
@@ -113,28 +122,59 @@ static bool compileWithAirAs(
   if (air_as.empty()) return false;
   airlog("compileWithAirAs: using air-as=%s", air_as.c_str());
 
-  // Write module as text IR to a temp file.
+  // Unique temp names per call: same pid + multiple concurrent shader
+  // compilations would otherwise clobber each other's files.
+  static std::atomic<uint64_t> counter{0};
+  uint64_t id = counter.fetch_add(1);
   char tmp_ll[256], tmp_bc[256];
-  snprintf(tmp_ll, sizeof(tmp_ll), "/tmp/dxmt_airconv_%d.ll", (int)getpid());
-  snprintf(tmp_bc, sizeof(tmp_bc), "/tmp/dxmt_airconv_%d.bc", (int)getpid());
+  snprintf(tmp_ll, sizeof(tmp_ll), "/tmp/dxmt_airconv_%d_%llu.ll", (int)getpid(),
+           (unsigned long long)id);
+  snprintf(tmp_bc, sizeof(tmp_bc), "/tmp/dxmt_airconv_%d_%llu.bc", (int)getpid(),
+           (unsigned long long)id);
 
+  std::string ir_text, downgraded;
   {
+    // Print LLVM22-dialect textual IR, then downgrade it to the Apple
+    // AIR LLVM dialect that air-as understands (opaque pointers, memory()
+    // attributes, splat constants, typed function-ref metadata, ...).
+    {
+      raw_string_ostream ir_stream(ir_text);
+      module.print(ir_stream, nullptr);
+    }
+    std::string derr;
+    if (!dxmt::aircompat::DowngradeToAppleAIR(ir_text, downgraded, derr)) {
+      airlog("compileWithAirAs: downgrade FAILED: %s", derr.c_str());
+      return false;
+    }
     std::error_code ec;
     raw_fd_ostream ll_stream(tmp_ll, ec, sys::fs::OF_None);
     if (ec) return false;
-    module.print(ll_stream, nullptr);
+    ll_stream << downgraded;
   }
 
   // Run air-as to produce AIR-compatible bitcode.
-  std::string cmd =
-    "'" + air_as + "' -o '" + tmp_bc + "' '" + tmp_ll + "' 2>>/tmp/dxmt_airas.log";
+  std::string cmd = "'" + air_as + "' -o '" + tmp_bc + "' '" + tmp_ll + "'";
+  if (debugDumpEnabled())
+    cmd += " 2>>/tmp/dxmt_airas.log";
+  else
+    cmd += " 2>/dev/null";
   int ret = system(cmd.c_str());
-  remove(tmp_ll);
   if (ret != 0) {
-    airlog("compileWithAirAs: air-as FAILED ret=%d cmd=%s", ret, cmd.c_str());
+    airlog("compileWithAirAs: air-as FAILED ret=%d ll=%s", ret, tmp_ll);
+    static std::atomic<int> saved{0};
+    int n = saved.fetch_add(1);
+    if (debugDumpEnabled() && n < 64) {
+      system("/bin/mkdir -p /tmp/dxmt_fail 2>/dev/null");
+      char p[256];
+      snprintf(p, sizeof(p), "/tmp/dxmt_fail/shader_%d_%llu.air.ll", (int)getpid(),
+               (unsigned long long)id);
+      if (FILE *f = fopen(p, "w")) { fwrite(downgraded.data(), 1, downgraded.size(), f); fclose(f); }
+    }
+    remove(tmp_ll);
     remove(tmp_bc);
     return false;
   }
+  remove(tmp_ll);
 
   // Read result.
   auto buf = MemoryBuffer::getFile(tmp_bc);
@@ -147,6 +187,21 @@ static bool compileWithAirAs(
   auto &mb = *buf.get();
   out_bc.assign(mb.getBufferStart(), mb.getBufferEnd());
   airlog("compileWithAirAs: SUCCESS, %zu bytes", out_bc.size());
+
+  {
+    static std::atomic<int> okSaved{0};
+    int n = okSaved.fetch_add(1);
+    if (debugDumpEnabled() && n < 16) {
+      system("/bin/mkdir -p /tmp/dxmt_ok 2>/dev/null");
+      char p[256];
+      snprintf(p, sizeof(p), "/tmp/dxmt_ok/ok_%d_%llu.air.ll", (int)getpid(),
+               (unsigned long long)id);
+      if (FILE *f = fopen(p, "w")) { fwrite(downgraded.data(), 1, downgraded.size(), f); fclose(f); }
+      snprintf(p, sizeof(p), "/tmp/dxmt_ok/ok_%d_%llu.air", (int)getpid(),
+               (unsigned long long)id);
+      if (FILE *f = fopen(p, "wb")) { fwrite(out_bc.data(), 1, out_bc.size(), f); fclose(f); }
+    }
+  }
   return true;
 }
 
@@ -166,10 +221,46 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
 
   uint32_t fn_count = 0;
 
+  // Version fields must match what the AIR module actually declares, otherwise
+  // Apple's loader/AGX backend can reject the package.
+  uint8_t airMaj = 2, airMin = 6, langMaj = 3, langMin = 1;
+  uint8_t osMaj = 14, osMin = 4;
+  auto mdInt = [](const llvm::MDOperand &op, uint8_t fallback) -> uint8_t {
+    if (auto *cam = dyn_cast_or_null<ConstantAsMetadata>(op.get()))
+      if (auto *ci = dyn_cast<ConstantInt>(cam->getValue()))
+        return (uint8_t)ci->getZExtValue();
+    return fallback;
+  };
+  if (auto *v = module.getNamedMetadata("air.version")) {
+    if (v->getNumOperands() && v->getOperand(0)->getNumOperands() >= 2) {
+      auto *t = v->getOperand(0);
+      airMaj = mdInt(t->getOperand(0), airMaj);
+      airMin = mdInt(t->getOperand(1), airMin);
+    }
+  }
+  if (auto *v = module.getNamedMetadata("air.language_version")) {
+    if (v->getNumOperands() && v->getOperand(0)->getNumOperands() >= 3) {
+      auto *t = v->getOperand(0);
+      langMaj = mdInt(t->getOperand(1), langMaj);
+      langMin = mdInt(t->getOperand(2), langMin);
+    }
+  }
+  {
+    std::string triple = module.getTargetTriple().str();
+    size_t m = triple.find("macosx");
+    if (m != std::string::npos) {
+      int a = 0, b = 0;
+      if (sscanf(triple.c_str() + m + 6, "%d.%d", &a, &b) >= 1) {
+        osMaj = (uint8_t)a;
+        osMin = (uint8_t)b;
+      }
+    }
+  }
+
   airlog("MetallibWriter::Write called (new air-as build)");
   // Try to produce AIR-compatible bitcode via Apple's air-as.
   // This avoids the "Failed to upgrade function bitcode" error that occurs
-  // when LLVM 22 binary bitcode is fed to Apple's older Metal AGX reader.
+  // when LLVM 22 binary bitcode is fed directly to Apple's Metal AGX reader.
   if (!compileWithAirAs(module, bitcode)) {
     raw_svector_ostream bitcode_stream(bitcode);
     WriteBitcodeToFile(module, bitcode_stream, false, nullptr, true);
@@ -207,10 +298,10 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
           .BitcodeOffset = 0, // ??
         });
         function_def_stream << value(MTLB_VERS_TAG{
-          .airVersionMajor = 2,
-          .airVersionMinor = 6,
-          .languageVersionMajor = 3,
-          .languageVersionMinor = 1,
+          .airVersionMajor = airMaj,
+          .airVersionMinor = airMin,
+          .languageVersionMajor = langMaj,
+          .languageVersionMinor = langMin,
         });
         while (fn->getNumOperands() > 3 && isa<MDTuple>(fn->getOperand(3).get())
         ) {
@@ -326,10 +417,10 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
           .BitcodeOffset = 0, // ??
         });
         function_def_stream << value(MTLB_VERS_TAG{
-          .airVersionMajor = 2,
-          .airVersionMinor = 6,
-          .languageVersionMajor = 3,
-          .languageVersionMinor = 1,
+          .airVersionMajor = airMaj,
+          .airVersionMinor = airMin,
+          .languageVersionMajor = langMaj,
+          .languageVersionMinor = langMin,
         });
         function_def_stream << "ENDT";
         public_metadata_stream << value(4);
@@ -360,10 +451,10 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
           .BitcodeOffset = 0, // ??
         });
         function_def_stream << value(MTLB_VERS_TAG{
-          .airVersionMajor = 2,
-          .airVersionMinor = 6,
-          .languageVersionMajor = 3,
-          .languageVersionMinor = 1,
+          .airVersionMajor = airMaj,
+          .airVersionMinor = airMin,
+          .languageVersionMajor = langMaj,
+          .languageVersionMinor = langMin,
         });
         function_def_stream << "ENDT";
 
@@ -454,10 +545,10 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
           .BitcodeOffset = 0, // ??
         });
         function_def_stream << value(MTLB_VERS_TAG{
-          .airVersionMajor = 2,
-          .airVersionMinor = 6,
-          .languageVersionMajor = 3,
-          .languageVersionMinor = 1,
+          .airVersionMajor = airMaj,
+          .airVersionMinor = airMin,
+          .languageVersionMajor = langMaj,
+          .languageVersionMinor = langMin,
         });
         function_def_stream << "ENDT";
 
@@ -495,10 +586,10 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
           .BitcodeOffset = 0, // ??
         });
         function_def_stream << value(MTLB_VERS_TAG{
-          .airVersionMajor = 2,
-          .airVersionMinor = 6,
-          .languageVersionMajor = 3,
-          .languageVersionMinor = 1,
+          .airVersionMajor = airMaj,
+          .airVersionMinor = airMin,
+          .languageVersionMajor = langMaj,
+          .languageVersionMinor = langMin,
         });
         function_def_stream << "ENDT";
 
@@ -541,8 +632,8 @@ void MetallibWriter::Write(const llvm::Module &module, raw_ostream &OS) {
   header.VersionMajor = 2;
   header.VersionMinor = 7;
   header.OS = OS::MTLBOS_macOS;
-  header.OSVersionMajor = 14;
-  header.OSVersionMinor = 4;
+  header.OSVersionMajor = osMaj;
+  header.OSVersionMinor = osMin;
 
   // write to stream
   OS << value(header);

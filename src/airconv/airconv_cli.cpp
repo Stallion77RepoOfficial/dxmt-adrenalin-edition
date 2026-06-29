@@ -66,13 +66,13 @@ static cl::opt<bool>
   OptLevelO2("O2", cl::desc("Optimization level 2. Similar to clang -O2. "));
 
 static cl::opt<bool> PreserveBitcodeUseListOrder(
-  "preserve-bc-uselistorder",
+  "dxmt-preserve-bc-uselistorder",
   cl::desc("Preserve use-list order when writing LLVM bitcode."),
   cl::init(false), cl::Hidden
 );
 
 static cl::opt<bool> PreserveAssemblyUseListOrder(
-  "preserve-ll-uselistorder",
+  "dxmt-preserve-ll-uselistorder",
   cl::desc("Preserve use-list order when writing LLVM assembly."),
   cl::init(false), cl::Hidden
 );

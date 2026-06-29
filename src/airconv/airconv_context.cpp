@@ -40,14 +40,14 @@ namespace dxmt {
 
 void initializeModule(llvm::Module &M) {
   M.setSourceFileName("airconv_generated.metal");
-  M.setTargetTriple(llvm::Triple("air64-apple-macosx14.0.0"));
+  M.setTargetTriple(llvm::Triple("air64-apple-macosx26.0.0"));
   M.setDataLayout(
     "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:"
     "64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-"
     "v128:128:128-v192:256:256-v256:256:256-v512:512:512-v1024:1024:1024-n8:"
     "16:32"
   );
-  M.setSDKVersion(VersionTuple(15, 0));
+  M.setSDKVersion(VersionTuple(26, 0));
   M.addModuleFlag(Module::ModFlagBehavior::Error, "wchar_size", 4);
   M.addModuleFlag(Module::ModFlagBehavior::Max, "frame-pointer", 2);
   M.addModuleFlag(Module::ModFlagBehavior::Max, "air.max_device_buffers", 31);
@@ -140,7 +140,10 @@ runOptimizationPasses(llvm::Module &M) {
     // Create a small function pass pipeline to cleanup after all the global
     // optimizations.
     FunctionPassManager GlobalCleanupPM;
-    GlobalCleanupPM.addPass(InstCombinePass());
+    // InstCombine folds opaque-pointer argument-buffer struct accesses into
+    // byte GEPs. Apple's AIR/AGX path is sensitive to the original typed
+    // argument-buffer layout, and the AIR text downgrade reconstructs typed
+    // pointers from that metadata.
 
     GlobalCleanupPM.addPass(SimplifyCFGPass(SimplifyCFGOptions().convertSwitchRangeToICmp(true)));
 

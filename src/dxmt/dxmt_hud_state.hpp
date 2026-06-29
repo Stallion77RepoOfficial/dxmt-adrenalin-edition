@@ -21,8 +21,8 @@ enum class HudElement : uint32_t {
 
 class HUDState {
 public:
-  // Parses DXMT_HUD and, when enabled, registers the heading label with the
-  // native Metal HUD. Does nothing (zero cost) when the HUD is disabled.
+  // Registers the heading label when either DXMT_HUD or Apple's Metal HUD is
+  // enabled. DXMT_HUD controls the optional extra DXMT statistics lines.
   void initialize(const std::string &heading);
 
   void begin();

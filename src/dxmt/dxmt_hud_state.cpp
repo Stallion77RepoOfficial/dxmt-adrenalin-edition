@@ -61,8 +61,10 @@ parseHudElements(const std::string &config) {
 
 void
 HUDState::initialize(const std::string &heading) {
-  elements_ = parseHudElements(env::getEnvVar("DXMT_HUD"));
-  enabled_ = elements_ != 0;
+  std::string dxmt_hud = env::getEnvVar("DXMT_HUD");
+  std::string metal_hud = env::getEnvVar("MTLHUDEnabled");
+  elements_ = parseHudElements(dxmt_hud);
+  enabled_ = elements_ != 0 || (!metal_hud.empty() && metal_hud != "0");
   if (!enabled_)
     return;
 

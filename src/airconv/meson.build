@@ -11,6 +11,7 @@ airconv_src = files([
  'dxbc_instructions.cpp',
  'dxbc_signature.cpp',
  'metallib_writer.cpp',
+ 'air_compat_text_writer.cpp',
  'nt/air_builder.cpp',
  'nt/dxbc_converter_base.cpp',
  'transforms/lower_16bit_texread.cpp',
@@ -52,7 +53,7 @@ airconv_shaders = [
 
 airconv_shaders_ir = metalir_generator.process(
   airconv_shaders,
-  extra_args: ['-std=metal3.1', '--target=air64-apple-macos14.0'],
+  extra_args: ['-std=metal4.0', '--target=air64-apple-macos26.0'],
 )
 airconv_shaders_header = hexdump_generator.process(airconv_shaders_ir)
 

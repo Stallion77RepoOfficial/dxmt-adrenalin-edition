@@ -51,7 +51,8 @@ public:
         device_.setShouldMaximizeConcurrentCompilation(true);
     } else {
       max_object_threadgroups_ = -1ull;
-      device_.setShouldMaximizeConcurrentCompilation(true);
+      if (!(macos_major_version >= 26 && macos_minor_version < 2))
+        device_.setShouldMaximizeConcurrentCompilation(true);
     }
   }
 
