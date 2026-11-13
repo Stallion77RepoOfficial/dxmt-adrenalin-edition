@@ -68,7 +68,7 @@ public:
   STDMETHODCALLTYPE
   CreateShaderResourceView(const D3D11_SHADER_RESOURCE_VIEW_DESC1 *pDesc,
                            ID3D11ShaderResourceView1 **ppView) override {
-    D3D11_SHADER_RESOURCE_VIEW_DESC1 finalDesc;
+    D3D11_SHADER_RESOURCE_VIEW_DESC1 finalDesc = {};
     if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc,
                                                     &finalDesc))) {
       ERR("DynamicTexture: Failed to create SRV descriptor");
@@ -81,11 +81,11 @@ public:
     } else {
       arraySize = this->desc.ArraySize;
     }
-    if (FAILED(InitializeAndNormalizeViewDescriptor(
+    if (HRESULT hr = InitializeAndNormalizeViewDescriptor(
             this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
-        ))) {
+        ); FAILED(hr)) {
       ERR("DynamicTexture: Failed to create texture SRV");
-      return E_FAIL;
+      return hr;
     }
     if (!ppView) {
       return S_FALSE;

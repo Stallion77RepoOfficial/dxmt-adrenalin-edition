@@ -150,7 +150,7 @@ public:
     UINT buffer_length = 0, &row_pitch = buffer_length;
     UINT bind_flag = 0, &depth_pitch = bind_flag;
     if (auto dynamic = GetDynamicBuffer(pResource, &buffer_length, &bind_flag)) {
-      if (!pMappedResource)
+      if (!pMappedResource || Subresource)
         return E_INVALIDARG;
       switch (MapType) {
       case D3D11_MAP_READ:
@@ -193,7 +193,7 @@ public:
       return S_OK;
     }
     if (auto dynamic = GetDynamicLinearTexture(pResource, &row_pitch, &depth_pitch)) {
-      if (!pMappedResource)
+      if (!pMappedResource || Subresource)
         return E_INVALIDARG;
       switch (MapType) {
       case D3D11_MAP_READ:
@@ -390,7 +390,40 @@ public:
   void
   STDMETHODCALLTYPE
   ExecuteCommandList(ID3D11CommandList *pCommandList, BOOL RestoreContextState) override{
-    UNIMPLEMENTED("ExecuteCommandList on deferred context");
+    /* A command list recorded into another one runs where it was recorded.
+     * Its queries and staging uses join this list's, its visibility queries
+     * numbered after this list's own. The dynamic buffers it renamed are left
+     * out: executing this list does not tell the immediate context their
+     * latest names, as executing the inner list itself would. */
+    ResetEncodingContextState();
+
+    Com<MTLD3D11CommandList, false> cmdlist = static_cast<MTLD3D11CommandList *>(pCommandList);
+    auto &list = ctx_state.current_cmdlist;
+
+    promote_flush |= cmdlist->promote_flush;
+    uint32_t query_base = list->visibility_query_count;
+    for (const auto &[query, index] : cmdlist->issued_visibility_query)
+      list->issued_visibility_query.emplace_back(query, query_base + index);
+    list->visibility_query_count += cmdlist->visibility_query_count;
+    for (const auto &query : cmdlist->issued_event_query)
+      list->issued_event_query.push_back(query);
+    for (const auto &query : cmdlist->issued_timestamp_query)
+      list->issued_timestamp_query.push_back(query);
+    for (const auto &staging : cmdlist->read_staging_resources)
+      list->read_staging_resources.push_back(staging);
+    for (const auto &staging : cmdlist->written_staging_resources)
+      list->written_staging_resources.push_back(staging);
+
+    EmitOP([cmdlist = std::move(cmdlist), query_base](ArgumentEncodingContext &enc) {
+      enc.pushDeferredVisibilityQueries(enc.currentDeferredVisibilityQueries() + query_base);
+      cmdlist->Execute(enc);
+      enc.popDeferredVisibilityQueries();
+    });
+
+    if (RestoreContextState)
+      RestoreEncodingContextState();
+    else
+      ResetD3D11ContextState();
   }
 
   HRESULT 

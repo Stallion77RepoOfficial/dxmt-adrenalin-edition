@@ -28,6 +28,23 @@ public:
       return S_OK;
     }
 
+    /* A query whose answer is a yes or no is also a predicate; the interface
+     * adds nothing to ID3D11Query, so this object is one as it stands. */
+    if (riid == __uuidof(ID3D11Predicate)) {
+      switch (desc_.Query) {
+      case D3D11_QUERY_OCCLUSION_PREDICATE:
+      case D3D11_QUERY_SO_OVERFLOW_PREDICATE:
+      case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM0:
+      case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM1:
+      case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM2:
+      case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM3:
+        *ppvObject = ref(this);
+        return S_OK;
+      default:
+        break;
+      }
+    }
+
     if (riid == __uuidof(ID3D10DeviceChild) || riid == __uuidof(ID3D10Query)) {
       *ppvObject = ref(&d3d10_);
       return S_OK;

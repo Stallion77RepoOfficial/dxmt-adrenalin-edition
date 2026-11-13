@@ -36,6 +36,17 @@ GetArrayType(llvm::Value *Array) {
   return llvm::cast<llvm::ArrayType>(llvm::cast<llvm::AllocaInst>(Array)->getAllocatedType());
 }
 
+// Opaque-pointer compat: with typed pointers gone, a register handle's pointee
+// type can no longer be recovered from the llvm::Value alone once it is a GEP
+// or bitcast result rather than a plain AllocaInst/GlobalVariable (true for
+// every hull/domain/geometry-stage output register, whose storage lives
+// inside a threadgroup/object-data payload, not a per-thread alloca). Callers
+// therefore carry the element type alongside the handle explicitly.
+llvm::ArrayType *
+GetArrayType(llvm::Type *ElemType) {
+  return llvm::cast<llvm::ArrayType>(ElemType);
+}
+
 llvm::Value *
 Converter::LoadOperandIndex(const IndexByTempComponent &SrcOpIndex) {
   auto Comp = SrcOpIndex.component;
@@ -66,6 +77,11 @@ Converter::LoadOperand(const SrcOperandConstantBuffer &SrcOp, mask_t Mask) {
 
   auto RangeId = SrcOp.rangeid;
 
+  /* An undeclared constant buffer reads as zero rather than aborting, which is
+   * what the error path below already does for a failed load. */
+  if (!res.cb_range_map.contains(RangeId))
+    return ApplySrcModifier(SrcOp._, llvm::ConstantAggregateZero::get(air.getIntTy(4)), Mask);
+
   auto V = res.cb_range_map[RangeId](nullptr).build(ctx);
   if (auto err = V.takeError()) {
     return ApplySrcModifier(SrcOp._, llvm::ConstantAggregateZero::get(air.getIntTy(4)), Mask);
@@ -88,7 +104,7 @@ Converter::LoadOperand(const SrcOperandConstantBuffer &SrcOp, mask_t Mask) {
 llvm::Value *
 Converter::LoadOperand(const SrcOperandImmediateConstantBuffer &SrcOp, mask_t Mask) {
   auto Handle = res.icb;
-  auto TyHandle = GetArrayType(Handle);
+  auto TyHandle = GetArrayType(res.icb->getValueType());
 
   if (auto Comp = ComponentFromScalarMask(Mask, SrcOp._.swizzle); Comp >= 0) {
     auto TyInt = air.getIntTy();
@@ -175,7 +191,7 @@ llvm::Value *
 Converter::LoadOperand(const SrcOperandInput &SrcOp, mask_t Mask) {
 
   auto Handle = res.input.ptr_int4;
-  auto TyHandle = GetArrayType(Handle);
+  auto TyHandle = GetArrayType(res.input.elem_type_int4);
 
   if (auto Comp = ComponentFromScalarMask(Mask, SrcOp._.swizzle); Comp >= 0) {
     auto TyInt = air.getIntTy();
@@ -194,11 +210,13 @@ llvm::Value *
 Converter::LoadOperand(const SrcOperandTemp &SrcOp, mask_t Mask) {
 
   auto Handle = res.temp.ptr_int4;
+  auto ElemType = res.temp.elem_type_int4;
 
   if (SrcOp.phase != ~0u) {
     Handle = res.phases[SrcOp.phase].temp.ptr_int4;
+    ElemType = res.phases[SrcOp.phase].temp.elem_type_int4;
   }
-  auto TyHandle = GetArrayType(Handle);
+  auto TyHandle = GetArrayType(ElemType);
   auto TyInt = air.getIntTy();
 
   if (auto Comp = ComponentFromScalarMask(Mask, SrcOp._.swizzle); Comp >= 0) {
@@ -287,7 +305,7 @@ Converter::LoadOperand(const SrcOperandIndexableTemp &SrcOp, mask_t Mask) {
   }
 
   auto Handle = regfile.ptr_int_vec;
-  auto TyHandle = GetArrayType(Handle);
+  auto TyHandle = GetArrayType(regfile.elem_type_int_vec);
   auto Index = LoadOperandIndex(SrcOp.regindex);
   auto TyInt = air.getIntTy();
 
@@ -316,7 +334,7 @@ llvm::Value *
 Converter::LoadOperand(const SrcOperandIndexableInput &SrcOp, mask_t Mask) {
 
   auto Handle = res.input.ptr_int4;
-  auto TyHandle = GetArrayType(Handle);
+  auto TyHandle = GetArrayType(res.input.elem_type_int4);
 
   if (auto Comp = ComponentFromScalarMask(Mask, SrcOp._.swizzle); Comp >= 0) {
     auto TyInt = air.getIntTy();
@@ -335,7 +353,7 @@ llvm::Value *
 Converter::LoadOperand(const SrcOperandInputICP &SrcOp, mask_t Mask) {
   /* applies to both hull and domain shader, in this case input is a "2d" array */
   auto Handle = res.input.ptr_int4;
-  auto TyHandle = GetArrayType(Handle);
+  auto TyHandle = GetArrayType(res.input.elem_type_int4);
 
   auto CPId = LoadOperandIndex(SrcOp.cpid);
   auto RegId = ir.getInt32(SrcOp.regid);
@@ -357,7 +375,7 @@ llvm::Value *
 Converter::LoadOperand(const SrcOperandInputPC &SrcOp, mask_t Mask) {
 
   auto Handle = res.patch_constant_output.ptr_int4;
-  auto TyHandle = GetArrayType(Handle);
+  auto TyHandle = GetArrayType(res.patch_constant_output.elem_type_int4);
 
   if (auto Comp = ComponentFromScalarMask(Mask, SrcOp._.swizzle); Comp >= 0) {
     auto TyInt = air.getIntTy();
@@ -376,7 +394,7 @@ llvm::Value *
 Converter::LoadOperand(const SrcOperandInputOCP &SrcOp, mask_t Mask) {
   /* applies to both hull and domain shader, in this case input is a "2d" array */
   auto Handle = res.output.ptr_int4;
-  auto TyHandle = GetArrayType(Handle);
+  auto TyHandle = GetArrayType(res.output.elem_type_int4);
 
   auto CPId = LoadOperandIndex(SrcOp.cpid);
   auto RegId = ir.getInt32(SrcOp.regid);
@@ -425,6 +443,13 @@ std::optional<TextureResourceHandle>
 Converter::LoadTexture(const SrcOperandResource &SrcOp) {
   using namespace llvm::air;
 
+  /* A shader that samples a register it never declared has no entry here, and
+   * operator[] would invent one whose accessors are empty -- calling those
+   * aborts the process instead of failing the conversion. The buffer paths
+   * below already guard this way. */
+  if (!ctx.resource.srv_range_map.contains(SrcOp.range_id))
+    return {};
+
   auto &[res, res_handle_fn, md_fn, global_coherent] = ctx.resource.srv_range_map[SrcOp.range_id];
   auto res_handle = res_handle_fn(nullptr).build(ctx);
   if (res_handle.takeError())
@@ -454,6 +479,9 @@ std::optional<TextureResourceHandle>
 Converter::LoadTexture(const SrcOperandUAV &SrcOp) {
   using namespace llvm::air;
 
+  if (!ctx.resource.uav_range_map.contains(SrcOp.range_id))
+    return {};
+
   auto &[res, res_handle_fn, md_fn, global_coherent] = ctx.resource.uav_range_map[SrcOp.range_id];
   auto res_handle = res_handle_fn(nullptr).build(ctx);
   if (res_handle.takeError())
@@ -482,6 +510,9 @@ Converter::LoadTexture(const SrcOperandUAV &SrcOp) {
 std::optional<TextureResourceHandle>
 Converter::LoadTexture(const AtomicDstOperandUAV &DstOp) {
   using namespace llvm::air;
+
+  if (!ctx.resource.uav_range_map.contains(DstOp.range_id))
+    return {};
 
   auto &[res, res_handle_fn, md_fn, global_coherent] = ctx.resource.uav_range_map[DstOp.range_id];
   auto res_handle = res_handle_fn(nullptr).build(ctx);
@@ -610,6 +641,9 @@ std::optional<SamplerHandle>
 Converter::LoadSampler(const SrcOperandSampler &SrcOp) {
   using namespace llvm::air;
 
+  if (!res.sampler_range_map.contains(SrcOp.range_id))
+    return {};
+
   auto &[sampler_handle_fn, sampler_cube_fn, sampler_metadata] = res.sampler_range_map[SrcOp.range_id];
   auto smp = sampler_handle_fn(nullptr).build(ctx);
   if (smp.takeError())
@@ -634,10 +668,12 @@ Converter::StoreOperand(const DstOperandOutput &DstOp, llvm::Value *Value) {
   auto ValueInt = ZExtAndBitcastToInt32(Value);
 
   auto Handle = res.output.ptr_int4;
+  auto ElemType = res.output.elem_type_int4;
   if (DstOp.phase != ~0u) {
     Handle = res.patch_constant_output.ptr_int4;
+    ElemType = res.patch_constant_output.elem_type_int4;
   }
-  auto TyHandle = GetArrayType(Handle);
+  auto TyHandle = GetArrayType(ElemType);
 
   if ((DstOp._.mask & kMaskAll) == kMaskAll) {
     auto Ptr = ir.CreateInBoundsGEP(TyHandle, Handle, {ir.getInt32(0), ir.getInt32(DstOp.regid)});
@@ -655,7 +691,7 @@ Converter::StoreOperandHull(const DstOperandOutput &DstOp, llvm::Value *Value) {
   auto ValueInt = ZExtAndBitcastToInt32(Value);
 
   auto Handle = res.output.ptr_int4;
-  auto TyHandle = GetArrayType(Handle);
+  auto TyHandle = GetArrayType(res.output.elem_type_int4);
 
   auto CPId = res.thread_id_in_patch;
   auto RegId = ir.getInt32(DstOp.regid);
@@ -700,10 +736,12 @@ Converter::StoreOperand(const DstOperandIndexableOutput &DstOp, llvm::Value *Val
   auto ValueInt = ZExtAndBitcastToInt32(Value);
 
   auto Handle = res.output.ptr_int4;
+  auto ElemType = res.output.elem_type_int4;
   if (DstOp.phase != ~0u) {
     Handle = res.patch_constant_output.ptr_int4;
+    ElemType = res.patch_constant_output.elem_type_int4;
   }
-  auto TyHandle = GetArrayType(Handle);
+  auto TyHandle = GetArrayType(ElemType);
   auto Index = LoadOperandIndex(DstOp.regindex);
 
   if ((DstOp._.mask & kMaskAll) == kMaskAll) {
@@ -722,7 +760,7 @@ Converter::StoreOperandHull(const DstOperandIndexableOutput &DstOp, llvm::Value 
   auto ValueInt = ZExtAndBitcastToInt32(Value);
 
   auto Handle = res.output.ptr_int4;
-  auto TyHandle = GetArrayType(Handle);
+  auto TyHandle = GetArrayType(res.output.elem_type_int4);
   auto Index = ir.CreateAdd(
       ir.CreateMul(res.thread_id_in_patch, ir.getInt32(res.output_element_count)), LoadOperandIndex(DstOp.regindex)
   );
@@ -743,11 +781,13 @@ Converter::StoreOperand(const DstOperandTemp &DstOp, llvm::Value *Value) {
   auto ValueInt = ZExtAndBitcastToInt32(Value);
 
   auto Handle = res.temp.ptr_int4;
+  auto ElemType = res.temp.elem_type_int4;
 
   if (DstOp.phase != ~0u) {
     Handle = res.phases[DstOp.phase].temp.ptr_int4;
+    ElemType = res.phases[DstOp.phase].temp.elem_type_int4;
   }
-  auto TyHandle = GetArrayType(Handle);
+  auto TyHandle = GetArrayType(ElemType);
 
   for (auto [DstComp, SrcComp] : EnumerateComponents(DstOp._.mask)) {
     auto Ptr = ir.CreateInBoundsGEP(
@@ -770,7 +810,7 @@ Converter::StoreOperand(const DstOperandIndexableTemp &DstOp, llvm::Value *Value
   }
 
   auto Handle = regfile.ptr_int_vec;
-  auto TyHandle = GetArrayType(Handle);
+  auto TyHandle = GetArrayType(regfile.elem_type_int_vec);
   auto Index = LoadOperandIndex(DstOp.regindex);
 
   for (auto [DstComp, SrcComp] : EnumerateComponents(DstOp._.mask)) {

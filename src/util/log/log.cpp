@@ -89,6 +89,14 @@ void Logger::emitMsg(LogLevel level, const std::string &message) {
       if (m_fileStream)
         m_fileStream << adjusted;
     }
+
+    // Flush the file stream after every message. std::ofstream is block
+    // buffered, so without this an abnormal exit (e.g. the swapchain teardown
+    // hanging and the process being force-killed) loses everything still in
+    // the buffer, leaving a 0-byte log. Flushing per message keeps the log
+    // usable for post-mortem diagnosis of hangs/crashes.
+    if (m_fileStream)
+      m_fileStream.flush();
   }
 }
 

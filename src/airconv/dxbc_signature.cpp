@@ -254,6 +254,18 @@ void handle_signature_vs(
       });
       max_output_register = std::max(reg + 1, max_output_register);
       if (sig.mask() == 0) break;
+      /* SV_PointSize is not a D3D10 system value -- DXMT's D3D9 layer names
+       * an output so to give its point primitives a size, which Metal takes
+       * from a vertex output and D3D10 and later fixed at one pixel. */
+      if (sig.semanticName() == "sv_pointsize") {
+        uint32_t assigned_index = func_signature.DefineOutput(OutputPointSize{});
+        signature_handlers.push_back([=](SignatureContext &ctx) {
+          if (ctx.skip_vertex_output)
+            return;
+          ctx.epilogue >> pop_output_reg(reg, 0b0001, assigned_index);
+        });
+        break;
+      }
       uint32_t assigned_index = func_signature.DefineOutput(OutputVertex{
         .user = sig.consistentAttributeName(),
         .type = to_msl_type(sig.componentType()),
@@ -438,6 +450,15 @@ void handle_signature_ps(
     });
     max_input_register = std::max(reg + 1, max_input_register);
     if (sig.mask() == 0) break;
+    /* The point sprite coordinate, the D3D9 layer's counterpart of
+     * SV_PointSize: a fragment input Metal provides, not a varying. */
+    if (sig.semanticName() == "sv_pointcoord") {
+      signature_handlers.push_back([=](SignatureContext &ctx) {
+        auto assigned_index = ctx.func_signature.DefineInput(InputPointCoord{});
+        ctx.prologue << init_input_reg(assigned_index, reg, 0b0011);
+      });
+      break;
+    }
     signature_handlers.push_back([=, type = sig.componentType(), name = sig.consistentAttributeName()]
     (SignatureContext &ctx) {
       bool pull_mode = bool(ctx.pull_mode_reg_mask & (1 << reg)) && interpolation != air::Interpolation::flat;

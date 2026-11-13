@@ -137,6 +137,29 @@ public:
   STDMETHODCALLTYPE
   Map(ID3D11Resource *pResource, UINT Subresource, D3D11_MAP MapType, UINT MapFlags,
       D3D11_MAPPED_SUBRESOURCE *pMappedResource) override {
+    if (unlikely(!pResource || !pMappedResource))
+      return E_INVALIDARG;
+    /* What a map may do was fixed when the resource was made: a dynamic one is
+     * only rewritten or appended to, anything else is read or written only as
+     * its CPU access allows. */
+    auto common = GetResourceCommon(pResource);
+    bool discarding = MapType == D3D11_MAP_WRITE_DISCARD || MapType == D3D11_MAP_WRITE_NO_OVERWRITE;
+    if (common->usage() == D3D11_USAGE_DYNAMIC
+            ? !discarding
+            : discarding || ((MapType & D3D11_MAP_READ) && !(common->cpuAccessFlags() & D3D11_CPU_ACCESS_READ)) ||
+                  ((MapType & D3D11_MAP_WRITE) && !(common->cpuAccessFlags() & D3D11_CPU_ACCESS_WRITE)))
+      return E_INVALIDARG;
+    return MapUnchecked(pResource, Subresource, MapType, MapFlags, pMappedResource);
+  }
+
+  HRESULT
+  MapForUpdate(ID3D11Resource *pResource, D3D11_MAP MapType, D3D11_MAPPED_SUBRESOURCE *pMappedResource) override {
+    return MapUnchecked(pResource, 0, MapType, 0, pMappedResource);
+  }
+
+  HRESULT
+  MapUnchecked(ID3D11Resource *pResource, UINT Subresource, D3D11_MAP MapType, UINT MapFlags,
+               D3D11_MAPPED_SUBRESOURCE *pMappedResource) {
     std::lock_guard<d3d11_device_mutex> lock(mutex);
 
     if (unlikely(!pResource || !pMappedResource))
@@ -146,6 +169,8 @@ public:
     auto current_seq_id = cmd_queue.CurrentSeqId();
     auto coherent_seq_id = cmd_queue.CoherentSeqId();
     if (auto dynamic = GetDynamicBuffer(pResource, &buffer_length, &bind_flag)) {
+      if (Subresource)
+        return E_INVALIDARG;
       switch (MapType) {
       case D3D11_MAP_READ:
       case D3D11_MAP_WRITE:
@@ -201,6 +226,8 @@ public:
       return S_OK;
     }
     if (auto dynamic = GetDynamicLinearTexture(pResource, &row_pitch, &depth_pitch)) {
+      if (Subresource)
+        return E_INVALIDARG;
       switch (MapType) {
       case D3D11_MAP_READ:
       case D3D11_MAP_WRITE:
@@ -278,9 +305,6 @@ public:
         coherent_seq_id = cmd_queue.CoherentSeqId();
       };
     };
-    if (pMappedResource == nullptr) {
-      UNIMPLEMENTED("map-on-default: map");
-    }
     return E_INVALIDARG;
   }
 

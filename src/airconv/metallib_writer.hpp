@@ -117,7 +117,10 @@ static_assert(sizeof(MTLB_VATY) == 2, "");
 class MetallibWriter {
 
 public:
-  void Write(const llvm::Module &module, llvm::raw_ostream &OS);
+  // Returns false if the module could not be assembled into AGX-compatible
+  // AIR bitcode (air-as unavailable or it rejected the module).
+  /* On failure, *error (when given) holds air-as's first diagnostic. */
+  bool Write(const llvm::Module &module, llvm::raw_ostream &OS, std::string *error = nullptr);
 };
 
 } // namespace dxmt::metallib

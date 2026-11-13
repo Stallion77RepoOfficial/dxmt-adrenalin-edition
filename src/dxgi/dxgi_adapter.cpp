@@ -217,13 +217,16 @@ public:
   HRESULT STDMETHODCALLTYPE
   RegisterHardwareContentProtectionTeardownStatusEvent(HANDLE event,
                                                        DWORD *cookie) override {
-    assert(0 && "TODO");
+    /* There is no protected content path, so no teardown to report. This
+     * used to fall off the end without a return value (an abort under the
+     * debug build's assert, undefined behaviour in a release build). */
+    if (cookie)
+      *cookie = 0;
+    return E_NOTIMPL;
   }
 
   void STDMETHODCALLTYPE
-  UnregisterHardwareContentProtectionTeardownStatus(DWORD cookie) override {
-    assert(0 && "TODO");
-  }
+  UnregisterHardwareContentProtectionTeardownStatus(DWORD cookie) override {}
 
   HRESULT STDMETHODCALLTYPE QueryVideoMemoryInfo(
       UINT NodeIndex, DXGI_MEMORY_SEGMENT_GROUP MemorySegmentGroup,
@@ -260,13 +263,18 @@ public:
 
   HRESULT STDMETHODCALLTYPE RegisterVideoMemoryBudgetChangeNotificationEvent(
       HANDLE event, DWORD *cookie) override {
-    assert(0 && "TODO");
+    /* The budget QueryVideoMemoryInfo reports does not change while the
+     * device lives, so there is never anything to signal. Engines that poll
+     * the budget call this at start-up; it used to fall off the end without
+     * a return value (an abort under the debug build's assert, undefined
+     * behaviour in a release build). */
+    if (cookie)
+      *cookie = 0;
+    return S_OK;
   }
 
   void STDMETHODCALLTYPE
-  UnregisterVideoMemoryBudgetChangeNotification(DWORD cookie) override {
-    assert(0 && "TODO");
-  }
+  UnregisterVideoMemoryBudgetChangeNotification(DWORD cookie) override {}
 
   WMT::Device STDMETHODCALLTYPE GetMTLDevice() final { return device_; }
   D3DKMT_HANDLE STDMETHODCALLTYPE GetLocalD3DKMT() final { return local_kmt_; }

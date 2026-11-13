@@ -44,6 +44,7 @@ public:
       PixelShader = nullptr;
       ps_valid_render_targets = 0;
     }
+    ready_.store(false, std::memory_order_relaxed);
   }
 
   void GetPipeline(MTL_COMPILED_GRAPHICS_PIPELINE *pPipeline) final {
@@ -60,8 +61,16 @@ public:
     if (!VertexShader->GetShader(&vs)) {
       return VertexShader;
     }
+    if (!vs.Function) {
+      ERR("Failed to create PSO: Invalid vertex shader.");
+      return this;
+    }
     if (PixelShader && !PixelShader->GetShader(&ps)) {
       return PixelShader;
+    }
+    if (PixelShader && !ps.Function) {
+      ERR("Failed to create PSO: Invalid pixel shader.");
+      return this;
     }
 
     WMTRenderPipelineInfo info;
@@ -99,7 +108,10 @@ public:
     state_ = device_->GetMTLDevice().newRenderPipelineState(info, err);
 
     if (state_ == nullptr) {
-      ERR("Failed to create PSO: ", err.description().getUTF8String());
+      if (err)
+        ERR("Failed to create PSO: ", err.description().getUTF8String());
+      else
+        ERR("Failed to create PSO: Invalid pipeline descriptor.");
       return this;
     }
 
@@ -142,12 +154,13 @@ class MTLCompiledComputePipelineImpl
 public:
   MTLCompiledComputePipelineImpl(MTLD3D11Device *pDevice, ManagedShader shader)
       : device_(pDevice) {
-    ComputeShader = shader->get_shader(ShaderVariantDefault{});
+      ComputeShader = shader->get_shader(ShaderVariantDefault{});
     uint32_t total_tgsize = shader->reflection().ThreadgroupSize[0] *
                             shader->reflection().ThreadgroupSize[1] *
                             shader->reflection().ThreadgroupSize[2];
     // FIXME: might be different on AMD GPU, if it's ever supported
     tgsize_is_multiple_of_sgwidth = (total_tgsize % 32) == 0;
+    ready_.store(false, std::memory_order_relaxed);
   }
 
   void GetPipeline(MTL_COMPILED_COMPUTE_PIPELINE *pPipeline) final {
@@ -164,6 +177,10 @@ public:
     if (!ComputeShader->GetShader(&cs)) {
       return ComputeShader;
     }
+    if (!cs.Function) {
+      ERR("Failed to create compute PSO: Invalid compute shader.");
+      return this;
+    }
 
     WMTComputePipelineInfo info;
     WMT::InitializeComputePipelineInfo(info);
@@ -175,7 +192,10 @@ public:
     state_ = device_->GetMTLDevice().newComputePipelineState(info, err);
 
     if (!state_) {
-      ERR("Failed to create compute PSO: ", err.description().getUTF8String());
+      if (err)
+        ERR("Failed to create compute PSO: ", err.description().getUTF8String());
+      else
+        ERR("Failed to create compute PSO: Invalid pipeline descriptor.");
       return this;
     }
 

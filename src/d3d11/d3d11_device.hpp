@@ -62,6 +62,11 @@ public:
 
   virtual unsigned int GetDirectXVersion() = 0;
 
+  /* D3D11On12: the D3D12 device that records through this one. Not a
+   * reference: the D3D12 device owns this device, and clears the pointer as it
+   * goes away. */
+  virtual void SetD3D12Device(IUnknown *pDevice) = 0;
+
   d3d11_device_mutex mutex;
 };
 

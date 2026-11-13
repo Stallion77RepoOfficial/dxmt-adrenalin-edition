@@ -38,6 +38,12 @@ struct ScalerInfo {
 struct FrameStatistics {
   Flags<FeatureCompatibility> compatibility_flags;
   uint32_t command_buffer_count = 0;
+  uint64_t encoded_command_count = 0;
+  uint64_t slow_command_count = 0;
+  clock::duration worst_command{};
+  uint64_t worst_command_index = 0;
+  uint32_t async_pipeline_skips = 0;
+  uint64_t worst_command_vptr = 0;
   uint32_t sync_count = 0;
   clock::duration sync_interval{};
   clock::duration commit_interval{};
@@ -60,6 +66,12 @@ struct FrameStatistics {
   reset() {
     compatibility_flags.clrAll();
     command_buffer_count = 0;
+    encoded_command_count = 0;
+    slow_command_count = 0;
+    worst_command = {};
+    worst_command_index = 0;
+    async_pipeline_skips = 0;
+    worst_command_vptr = 0;
     sync_count = 0;
     sync_interval = {};
     commit_interval = {};
@@ -145,6 +157,17 @@ public:
       max_.present_latency_interval = std::max(max_.present_latency_interval, frames_[i].present_latency_interval);
 
       average_.command_buffer_count += frames_[i].command_buffer_count;
+      average_.encoded_command_count += frames_[i].encoded_command_count;
+      max_.async_pipeline_skips = std::max(max_.async_pipeline_skips, frames_[i].async_pipeline_skips);
+      average_.slow_command_count += frames_[i].slow_command_count;
+      if (frames_[i].worst_command > max_.worst_command) {
+        max_.worst_command = frames_[i].worst_command;
+        max_.worst_command_index = frames_[i].worst_command_index;
+        max_.worst_command_vptr = frames_[i].worst_command_vptr;
+      }
+      /* A count averaged over the window is integer-divided to zero when only
+       * one frame in it stalls -- which is exactly the case worth seeing. */
+      max_.slow_command_count = std::max(max_.slow_command_count, frames_[i].slow_command_count);
       average_.sync_count += frames_[i].sync_count;
       average_.event_stall += frames_[i].event_stall;
       average_.commit_interval += frames_[i].commit_interval;
@@ -155,6 +178,8 @@ public:
       average_.present_latency_interval += frames_[i].present_latency_interval;
     }
     average_.command_buffer_count /= (kFrameStatisticsCount - 1);
+    average_.encoded_command_count /= (kFrameStatisticsCount - 1);
+    average_.slow_command_count /= (kFrameStatisticsCount - 1);
     average_.sync_count /= (kFrameStatisticsCount - 1);
     average_.event_stall /= (kFrameStatisticsCount - 1);
     average_.commit_interval /= (kFrameStatisticsCount - 1);

@@ -78,8 +78,10 @@ HRESULT ExtractMTLInputLayoutElements(
   }
   for (UINT i = 0; i < num_parameters; i++) {
     auto &inputSig = pParameters[i];
-    if (inputSig.SystemValue != D3D10_SB_NAME_UNDEFINED) 
-      continue; // ignore SIV & SGV
+    /* The input assembler generates these two; anything else the signature
+     * reads -- an SV_Position in a pixel shader's, say -- needs an element. */
+    if (!strcasecmp(inputSig.SemanticName, "SV_VertexID") || !strcasecmp(inputSig.SemanticName, "SV_InstanceID"))
+      continue;
     if (!(register_mask & (1 << inputSig.Register))) {
       WARN("CreateInputLayout: Vertex shader expects ", inputSig.SemanticName,
            "_", inputSig.SemanticIndex, " but it's not in input layout element descriptors");

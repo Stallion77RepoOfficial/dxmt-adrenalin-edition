@@ -58,6 +58,28 @@ struct MTL_DXGI_FORMAT_DESC {
   uint32_t Flag;
 };
 
+/* View formats only DXMT's D3D9 layer creates, far above every DXGI_FORMAT.
+ * D3D9 fills the channels a format lacks differently from D3D10 and later --
+ * luminance in all three colour channels, a missing channel as 1 -- and Metal
+ * expresses that as the view's swizzle. */
+enum DXMT_D3D9_VIEW_FORMAT : uint32_t {
+  DXMT_FORMAT_R8_UNORM_RRR1 = 0x10000, // L8
+  DXMT_FORMAT_R8G8_UNORM_RRRG,         // A8L8
+  DXMT_FORMAT_R16_UNORM_RRR1,          // L16
+  DXMT_FORMAT_R8G8_SNORM_RG11,         // V8U8
+  DXMT_FORMAT_R16G16_SNORM_RG11,       // V16U16
+  DXMT_FORMAT_R16G16_UNORM_RG11,       // G16R16
+  DXMT_FORMAT_R16_FLOAT_R111,          // R16F
+  DXMT_FORMAT_R16G16_FLOAT_RG11,       // G16R16F
+  DXMT_FORMAT_R32_FLOAT_R111,          // R32F
+  DXMT_FORMAT_R32G32_FLOAT_RG11,       // G32R32F
+  DXMT_FORMAT_B5G5R5X1_UNORM,          // X1R5G5B5
+  DXMT_FORMAT_R24_UNORM_X8_RRRR,       // INTZ: depth in every channel
+  DXMT_FORMAT_R16_UNORM_R001,          // DF16: depth in red, 0 0 1
+  DXMT_FORMAT_BC4_UNORM_RRRR,          // ATI1
+  DXMT_FORMAT_BC5_UNORM_GR11,          // ATI2
+};
+
 int32_t MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &description);
 
 uint32_t MTLGetTexelSize(WMTPixelFormat format);

@@ -137,6 +137,9 @@ struct D3D11ResourceCommon : ID3D11Resource {
   Rc<Buffer> buffer_{};
   Rc<Texture> texture_{};
   uint32_t bind_flags_{};
+  uint32_t cpu_access_flags_{};
+  uint32_t misc_flags_{};
+  D3D11_USAGE usage_{};
 
   const Rc<Buffer> &buffer() const {
     return buffer_;
@@ -146,6 +149,15 @@ struct D3D11ResourceCommon : ID3D11Resource {
   }
   uint32_t bindFlags() const {
     return bind_flags_;
+  }
+  uint32_t cpuAccessFlags() const {
+    return cpu_access_flags_;
+  }
+  D3D11_USAGE usage() const {
+    return usage_;
+  }
+  uint32_t miscFlags() const {
+    return misc_flags_;
   }
   bool
   hazardsFree() const {
@@ -190,6 +202,50 @@ public:
       d3d10(reinterpret_cast<tag::COM *>(this), device->GetImmediateContextPrivate()) {
     // D3D11ResourceCommonß::bind_flags_
     this->bind_flags_ = desc.BindFlags;
+    this->cpu_access_flags_ = desc.CPUAccessFlags;
+    this->misc_flags_ = desc.MiscFlags;
+    this->usage_ = desc.Usage;
+    /* A texture of one subresource is also a DXGI surface -- what Direct2D
+     * draws into and what a swap chain's buffer is asked for as. */
+    if constexpr (tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D ||
+                  tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+      if (desc.MipLevels == 1 && desc.ArraySize == 1)
+        dxgi_surface.reset(new MTLDXGISurface<TResourceBase<tag, Base...>>(this));
+    }
+  }
+
+  ~TResourceBase() {
+    if (gdi_dc_)
+      FreeGdiSurface();
+  }
+
+  /* D3D11 device children keep their device alive while the application holds
+   * one. Without it the device's reference count did not move when a resource
+   * or view was created, and an application that releases the device while
+   * still using a texture it made from it is entitled to expect that to work.
+   *
+   * The reference goes to the container, because MTLD3D11Device::AddRef
+   * forwards there, and no cycle results: the context holds everything it has
+   * bound through Com<T, false>, which is a private reference. */
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    uint32_t refCount = this->m_refCount++;
+    if (unlikely(!refCount)) {
+      this->m_parent->AddRef();
+      this->AddRefPrivate();
+    }
+    return refCount + 1;
+  }
+
+  ULONG STDMETHODCALLTYPE Release() override {
+    uint32_t refCount = --this->m_refCount;
+    if (unlikely(!refCount)) {
+      /* The private release can destroy this object, so the device is read
+       * before it happens rather than through `this` afterwards. */
+      auto *parent = this->m_parent;
+      this->ReleasePrivate();
+      parent->Release();
+    }
+    return refCount;
   }
 
   template <std::size_t n> HRESULT ResolveBase(REFIID riid, void **ppvObject) {
@@ -235,6 +291,12 @@ public:
         riid == __uuidof(IDXGIDeviceSubObject) ||
         riid == __uuidof(IDXGIResource) || riid == __uuidof(IDXGIResource1)) {
       *ppvObject = ref(dxgi_resource.get());
+      return S_OK;
+    }
+
+    if (dxgi_surface && (riid == __uuidof(IDXGISurface) || riid == __uuidof(IDXGISurface1) ||
+                         riid == __uuidof(IDXGISurface2))) {
+      *ppvObject = ref(dxgi_surface.get());
       return S_OK;
     }
 
@@ -304,9 +366,174 @@ public:
     return E_INVALIDARG;
   }
 
+  /* IDXGISurface, through MTLDXGISurface. Only single-subresource 1D and 2D
+   * textures have one. */
+  HRESULT
+  GetDXGISurfaceDesc(DXGI_SURFACE_DESC *pDesc) {
+    if constexpr (tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+      pDesc->Width = desc.Width;
+      pDesc->Height = desc.Height;
+      pDesc->Format = desc.Format;
+      pDesc->SampleDesc = desc.SampleDesc;
+      return S_OK;
+    } else if constexpr (tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D) {
+      pDesc->Width = desc.Width;
+      pDesc->Height = 1;
+      pDesc->Format = desc.Format;
+      pDesc->SampleDesc = {1, 0};
+      return S_OK;
+    }
+    return DXGI_ERROR_INVALID_CALL;
+  }
+
+  HRESULT
+  MapDXGISurface(DXGI_MAPPED_RECT *pRect, UINT Flags) {
+    if (!pRect)
+      return DXGI_ERROR_INVALID_CALL;
+    D3D11_MAP type;
+    if ((Flags & DXGI_MAP_READ) && (Flags & DXGI_MAP_WRITE))
+      type = D3D11_MAP_READ_WRITE;
+    else if (Flags & DXGI_MAP_READ)
+      type = D3D11_MAP_READ;
+    else if (Flags & DXGI_MAP_WRITE)
+      type = (Flags & DXGI_MAP_DISCARD) ? D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE;
+    else
+      return DXGI_ERROR_INVALID_CALL;
+    Com<ID3D11DeviceContext> context;
+    this->m_parent->GetImmediateContext(&context);
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = context->Map(static_cast<D3D11ResourceCommon *>(this), 0, type, 0, &mapped);
+    if (FAILED(hr))
+      return hr;
+    pRect->Pitch = mapped.RowPitch;
+    pRect->pBits = static_cast<BYTE *>(mapped.pData);
+    return S_OK;
+  }
+
+  HRESULT
+  UnmapDXGISurface() {
+    Com<ID3D11DeviceContext> context;
+    this->m_parent->GetImmediateContext(&context);
+    context->Unmap(static_cast<D3D11ResourceCommon *>(this), 0);
+    return S_OK;
+  }
+
+  /* GetDC hands out a 32-bit DIB of the texture -- every GDI-compatible format
+   * is B8G8R8A8 or B8G8R8X8, the DIB's own layout -- and ReleaseDC uploads it
+   * back. */
+  HRESULT
+  GetDXGISurfaceDC(BOOL Discard, HDC *phdc) {
+    if (!phdc)
+      return E_INVALIDARG;
+    *phdc = nullptr;
+    if constexpr (tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+      if (!(desc.MiscFlags & D3D11_RESOURCE_MISC_GDI_COMPATIBLE) || gdi_dc_)
+        return DXGI_ERROR_INVALID_CALL;
+      BITMAPINFO info = {};
+      info.bmiHeader.biSize = sizeof(info.bmiHeader);
+      info.bmiHeader.biWidth = desc.Width;
+      info.bmiHeader.biHeight = -(LONG)desc.Height; // top-down, as the texture
+      info.bmiHeader.biPlanes = 1;
+      info.bmiHeader.biBitCount = 32;
+      info.bmiHeader.biCompression = BI_RGB;
+      void *bits = nullptr;
+      HBITMAP bitmap = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+      if (!bitmap)
+        return E_OUTOFMEMORY;
+      HDC dc = CreateCompatibleDC(nullptr);
+      if (!dc) {
+        DeleteObject(bitmap);
+        return E_OUTOFMEMORY;
+      }
+      gdi_old_bitmap_ = SelectObject(dc, bitmap);
+      gdi_dc_ = dc;
+      gdi_bitmap_ = bitmap;
+      gdi_bits_ = bits;
+      if (!Discard)
+        ReadIntoGdiSurface();
+      *phdc = dc;
+      return S_OK;
+    }
+    return DXGI_ERROR_INVALID_CALL;
+  }
+
+  HRESULT
+  ReleaseDXGISurfaceDC(RECT *pDirtyRect) {
+    if constexpr (tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+      if (!gdi_dc_)
+        return DXGI_ERROR_INVALID_CALL;
+      GdiFlush();
+      LONG left = 0, top = 0, right = desc.Width, bottom = desc.Height;
+      if (pDirtyRect) {
+        left = std::max(left, pDirtyRect->left);
+        top = std::max(top, pDirtyRect->top);
+        right = std::min(right, pDirtyRect->right);
+        bottom = std::min(bottom, pDirtyRect->bottom);
+      }
+      if (left < right && top < bottom) {
+        UINT pitch = desc.Width * 4;
+        D3D11_BOX box = {(UINT)left, (UINT)top, 0, (UINT)right, (UINT)bottom, 1};
+        Com<ID3D11DeviceContext> context;
+        this->m_parent->GetImmediateContext(&context);
+        context->UpdateSubresource(
+            static_cast<D3D11ResourceCommon *>(this), 0, &box,
+            static_cast<const char *>(gdi_bits_) + top * pitch + left * 4, pitch, 0
+        );
+      }
+      FreeGdiSurface();
+      return S_OK;
+    }
+    return DXGI_ERROR_INVALID_CALL;
+  }
+
+private:
+  void
+  ReadIntoGdiSurface() {
+    if constexpr (tag::dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+      D3D11_TEXTURE2D_DESC staging_desc = {};
+      staging_desc.Width = desc.Width;
+      staging_desc.Height = desc.Height;
+      staging_desc.MipLevels = 1;
+      staging_desc.ArraySize = 1;
+      staging_desc.Format = desc.Format;
+      staging_desc.SampleDesc = {1, 0};
+      staging_desc.Usage = D3D11_USAGE_STAGING;
+      staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      Com<ID3D11Texture2D> staging;
+      if (FAILED(this->m_parent->CreateTexture2D(&staging_desc, nullptr, &staging)))
+        return;
+      Com<ID3D11DeviceContext> context;
+      this->m_parent->GetImmediateContext(&context);
+      context->CopyResource(staging.ptr(), static_cast<D3D11ResourceCommon *>(this));
+      D3D11_MAPPED_SUBRESOURCE mapped;
+      if (FAILED(context->Map(staging.ptr(), 0, D3D11_MAP_READ, 0, &mapped)))
+        return;
+      for (UINT y = 0; y < desc.Height; y++)
+        memcpy(static_cast<char *>(gdi_bits_) + y * desc.Width * 4,
+               static_cast<const char *>(mapped.pData) + y * mapped.RowPitch, desc.Width * 4);
+      context->Unmap(staging.ptr(), 0);
+    }
+  }
+
+  void
+  FreeGdiSurface() {
+    SelectObject(gdi_dc_, gdi_old_bitmap_);
+    DeleteDC(gdi_dc_);
+    DeleteObject(gdi_bitmap_);
+    gdi_dc_ = nullptr;
+    gdi_bitmap_ = nullptr;
+    gdi_old_bitmap_ = nullptr;
+    gdi_bits_ = nullptr;
+  }
+
 protected:
   tag::DESC1 desc;
   std::unique_ptr<IDXGIResource1> dxgi_resource;
+  std::unique_ptr<MTLDXGISurface<TResourceBase<tag, Base...>>> dxgi_surface;
+  HDC gdi_dc_ = nullptr;
+  HBITMAP gdi_bitmap_ = nullptr;
+  HGDIOBJ gdi_old_bitmap_ = nullptr;
+  void *gdi_bits_ = nullptr;
   tag::D3D10_IMPL d3d10;
 };
 
@@ -388,6 +615,35 @@ public:
     }
     this->resource_ = pResource;
     this->bind_flags_ = this->resource_->bind_flags_;
+  }
+
+  /* D3D11 device children keep their device alive while the application holds
+   * one. Without it the device's reference count did not move when a resource
+   * or view was created, and an application that releases the device while
+   * still using a texture it made from it is entitled to expect that to work.
+   *
+   * The reference goes to the container, because MTLD3D11Device::AddRef
+   * forwards there, and no cycle results: the context holds everything it has
+   * bound through Com<T, false>, which is a private reference. */
+  ULONG STDMETHODCALLTYPE AddRef() override {
+    uint32_t refCount = this->m_refCount++;
+    if (unlikely(!refCount)) {
+      this->m_parent->AddRef();
+      this->AddRefPrivate();
+    }
+    return refCount + 1;
+  }
+
+  ULONG STDMETHODCALLTYPE Release() override {
+    uint32_t refCount = --this->m_refCount;
+    if (unlikely(!refCount)) {
+      /* The private release can destroy this object, so the device is read
+       * before it happens rather than through `this` afterwards. */
+      auto *parent = this->m_parent;
+      this->ReleasePrivate();
+      parent->Release();
+    }
+    return refCount;
   }
 
   template <std::size_t n> HRESULT ResolveBase(REFIID riid, void **ppvObject) {

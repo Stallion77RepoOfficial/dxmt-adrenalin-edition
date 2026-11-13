@@ -79,7 +79,9 @@ MTLD3D11Inspection::MTLD3D11Inspection(WMT::Device pDevice)
   m_d3d9Shadow.SupportsDepthAsTextureWithLessEqualComparisonFilter = TRUE;
 
   m_d3d11Options1.ClearViewAlsoSupportsDepthOnlyFormats = TRUE;
-  m_d3d11Options1.MapOnDefaultBuffers = TRUE;
+  /* Not until a default resource can be mapped: an application told it
+   * could would map one and get E_INVALIDARG back. */
+  m_d3d11Options1.MapOnDefaultBuffers = FALSE;
   /**
   TODO: supported by Apple10 family
   */
@@ -91,8 +93,10 @@ MTLD3D11Inspection::MTLD3D11Inspection(WMT::Device pDevice)
       D3D11_CONSERVATIVE_RASTERIZATION_NOT_SUPPORTED;
   m_d3d11Options2.PSSpecifiedStencilRefSupported = TRUE;
   m_d3d11Options2.ROVsSupported = TRUE;
-  m_d3d11Options2.MapOnDefaultTextures = TRUE;
-  m_d3d11Options2.StandardSwizzle = TRUE;
+  m_d3d11Options2.MapOnDefaultTextures = FALSE;
+  /* The standard swizzle is a layout the CPU reads through a mapped
+   * default texture, which there is none of yet. */
+  m_d3d11Options2.StandardSwizzle = FALSE;
   m_d3d11Options2.TypedUAVLoadAdditionalFormats = TRUE;
   /**
   It's an intention to not report UMA

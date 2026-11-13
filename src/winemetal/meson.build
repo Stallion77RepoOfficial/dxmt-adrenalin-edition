@@ -1,6 +1,7 @@
 winemetal_src = [
   'main.c',
   'airconv_thunks.c',
+  'msc_thunks.c',
   'winemetal_thunks.c'
 ]
 

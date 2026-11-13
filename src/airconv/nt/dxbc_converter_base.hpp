@@ -505,7 +505,9 @@ public:
 
   bool
   IsConstantZero(llvm::Value *Value) const {
-    return llvm::isa<llvm::Constant>(Value) && llvm::cast<llvm::Constant>(Value)->isZeroValue();
+    // What LLVM 22's Constant::isZeroValue() did (+0.0 or -0.0); LLVM 23 removed it.
+    auto *Constant = llvm::dyn_cast<llvm::Constant>(Value);
+    return Constant && (Constant->isNullValue() || Constant->isNegativeZeroValue());
   }
 
   bool

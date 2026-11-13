@@ -1,0 +1,7 @@
+LIBRARY D3D8_DXMT.DLL
+EXPORTS
+    Direct3DCreate8
+    D3D8GetSWInfo
+    DebugSetMute
+    ValidatePixelShader
+    ValidateVertexShader

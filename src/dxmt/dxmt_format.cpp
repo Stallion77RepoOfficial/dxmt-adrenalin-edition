@@ -3,6 +3,7 @@
 #include "util_error.hpp"
 #include "dxgi.h"
 #include <cassert>
+#include <iterator>
 #include <cmath>
 #include <cstdint>
 
@@ -441,6 +442,29 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
   description.BytesPerTexel = 0;
   description.Flag = 0;
 
+  if (format >= DXMT_FORMAT_R8_UNORM_RRR1) {
+    static const struct {
+      uint32_t base;
+      uint32_t swizzle;
+    } kD3D9Views[] = {
+      {DXGI_FORMAT_R8_UNORM, WMTPixelFormatRRR1Swizzle},      {DXGI_FORMAT_R8G8_UNORM, WMTPixelFormatRRRGSwizzle},
+      {DXGI_FORMAT_R16_UNORM, WMTPixelFormatRRR1Swizzle},     {DXGI_FORMAT_R8G8_SNORM, WMTPixelFormatRG11Swizzle},
+      {DXGI_FORMAT_R16G16_SNORM, WMTPixelFormatRG11Swizzle},  {DXGI_FORMAT_R16G16_UNORM, WMTPixelFormatRG11Swizzle},
+      {DXGI_FORMAT_R16_FLOAT, WMTPixelFormatR111Swizzle},     {DXGI_FORMAT_R16G16_FLOAT, WMTPixelFormatRG11Swizzle},
+      {DXGI_FORMAT_R32_FLOAT, WMTPixelFormatR111Swizzle},     {DXGI_FORMAT_R32G32_FLOAT, WMTPixelFormatRG11Swizzle},
+      {DXGI_FORMAT_B5G5R5A1_UNORM, WMTPixelFormatRGB1Swizzle},
+      {DXGI_FORMAT_R24_UNORM_X8_TYPELESS, WMTPixelFormatRRRRSwizzle}, {DXGI_FORMAT_R16_UNORM, WMTPixelFormatR001Swizzle},
+      {DXGI_FORMAT_BC4_UNORM, WMTPixelFormatRRRRSwizzle},             {DXGI_FORMAT_BC5_UNORM, WMTPixelFormatGR11Swizzle},
+    };
+    uint32_t index = format - DXMT_FORMAT_R8_UNORM_RRR1;
+    if (index >= std::size(kD3D9Views) || MTLQueryDXGIFormat(device, kD3D9Views[index].base, description))
+      return E_FAIL;
+    /* The view's swizzle replaces whatever the base format has -- the depth
+     * plane of D24S8 reads (d, 0, 0, 1) on its own. */
+    description.PixelFormat = (WMTPixelFormat)(ORIGINAL_FORMAT(description.PixelFormat) | kD3D9Views[index].swizzle);
+    return S_OK;
+  }
+
   switch (format) {
   case DXGI_FORMAT_R32G32B32A32_TYPELESS: {
     description.PixelFormat = WMTPixelFormatRGBA32Uint;
@@ -560,7 +584,11 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
   }
   case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: {
     description.PixelFormat = WMTPixelFormatDepth32Float_Stencil8;
-    description.Flag = MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER;
+    /* A staging copy is laid out as D3D11 packs it, as for the typeless
+     * format: the CPU reads depth buffers through one. */
+    description.Flag = MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER |
+                       MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL;
+    description.BytesPerTexel = 8;
     break;
   }
   case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS: {
@@ -710,8 +738,10 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
     break;
   }
   case DXGI_FORMAT_D24_UNORM_S8_UINT: {
-    description.Flag = MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER | MTL_DXGI_FORMAT_EMULATED_D24;
+    description.Flag = MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER | MTL_DXGI_FORMAT_EMULATED_D24 |
+                       MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL; // staging layout, see above
     description.PixelFormat = WMTPixelFormatDepth32Float_Stencil8;
+    description.BytesPerTexel = 4;
     break;
   }
   case DXGI_FORMAT_R24_UNORM_X8_TYPELESS: {

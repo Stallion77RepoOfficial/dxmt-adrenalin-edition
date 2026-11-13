@@ -9,6 +9,10 @@
 #include <utility>
 #include <vector>
 
+#include <llvm/ADT/APFloat.h>
+#include <llvm/ADT/APInt.h>
+#include <llvm/Support/Error.h>
+
 namespace dxmt::aircompat {
 
 namespace {
@@ -35,6 +39,25 @@ std::string readValueName(const std::string &s, size_t pos, size_t &end) {
   }
   end = i;
   return s.substr(pos, i - pos);
+}
+
+// `load` and `store` may carry `atomic` and `volatile` ahead of the type.
+// Returns them as written, each followed by a space, and moves pos past them.
+std::string readMemoryQualifiers(const std::string &s, size_t &pos) {
+  std::string quals;
+  for (;;) {
+    while (pos < s.size() && std::isspace((unsigned char)s[pos]))
+      pos++;
+    if (s.compare(pos, 7, "atomic ") == 0) {
+      quals += "atomic ";
+      pos += 7;
+    } else if (s.compare(pos, 9, "volatile ") == 0) {
+      quals += "volatile ";
+      pos += 9;
+    } else {
+      return quals;
+    }
+  }
 }
 
 // Read one LLVM type starting at pos (skipping leading whitespace), including
@@ -226,6 +249,16 @@ std::string addrspaceOf(const std::string &ptrType) {
   return "";
 }
 
+/* The address space of a typed pointer ("i32 addrspace(1)*" ->
+ * "addrspace(1)"), in the form matchPtrType gives; "" for addrspace 0. */
+std::string typedPointerAddrspace(const std::string &typed) {
+  size_t a = typed.rfind("addrspace(");
+  if (a == std::string::npos)
+    return "";
+  size_t c = typed.find(')', a);
+  return c == std::string::npos ? "" : typed.substr(a, c - a + 1);
+}
+
 std::string airResourceStructKind(std::string kind) {
   for (size_t i = 1; i < kind.size(); i++) {
     if (std::isdigit((unsigned char)kind[i]) && kind[i - 1] != '_') {
@@ -262,6 +295,57 @@ std::string airArgTypeToLLVMFieldType(const std::string &name) {
   return "";
 }
 
+/* The LLVM type of a Metal scalar or vector type name, "" when unknown. */
+std::string airScalarLLVMType(const std::string &name) {
+  static const std::map<std::string, std::string> scalars = {
+      {"bool", "i1"},   {"char", "i8"},   {"uchar", "i8"},  {"short", "i16"},
+      {"ushort", "i16"}, {"int", "i32"},  {"uint", "i32"},  {"long", "i64"},
+      {"ulong", "i64"}, {"half", "half"}, {"float", "float"},
+  };
+  if (auto it = scalars.find(name); it != scalars.end())
+    return it->second;
+  if (name.size() > 1 && name.back() >= '2' && name.back() <= '4') {
+    auto it = scalars.find(name.substr(0, name.size() - 1));
+    if (it != scalars.end() && it->second != "i1")
+      return "<" + name.substr(name.size() - 1) + " x " + it->second + ">";
+  }
+  return "";
+}
+
+/* The type of one argument-buffer field, from the node describing the
+ * argument it holds: a buffer is a pointer into its address space, an
+ * indirect constant the value itself, anything else (textures, samplers)
+ * goes by its type name. "" when it cannot be told. */
+std::string airArgumentFieldType(const std::string &argNode, const std::string &typeName) {
+  auto quoted = [&](const char *key) -> std::string {
+    size_t k = argNode.find(key);
+    if (k == std::string::npos)
+      return "";
+    size_t q1 = argNode.find("!\"", k + std::strlen(key));
+    if (q1 == std::string::npos)
+      return "";
+    q1 += 2;
+    size_t q2 = argNode.find('"', q1);
+    return q2 == std::string::npos ? "" : argNode.substr(q1, q2 - q1);
+  };
+  std::string argType = quoted("!\"air.arg_type_name\"");
+  if (argType.empty())
+    argType = typeName;
+  if (argNode.find("!\"air.buffer\"") != std::string::npos) {
+    int space = 1;
+    size_t as = argNode.find("!\"air.address_space\", i32 ");
+    if (as != std::string::npos)
+      space = std::atoi(argNode.c_str() + as + std::strlen("!\"air.address_space\", i32 "));
+    std::string pointee = airScalarLLVMType(argType);
+    if (pointee.empty())
+      pointee = "i8";
+    return pointee + " addrspace(" + std::to_string(space) + ")*";
+  }
+  if (argNode.find("!\"air.indirect_constant\"") != std::string::npos)
+    return airScalarLLVMType(argType);
+  return airArgTypeToLLVMFieldType(argType);
+}
+
 std::string pointerPointeeType(const std::string &ptrType) {
   std::string s = trim(ptrType);
   if (s.empty() || s.back() != '*')
@@ -279,6 +363,254 @@ std::string pointerPointeeType(const std::string &ptrType) {
     }
   }
   return s;
+}
+
+std::string downgradeOpaquePtrTokens(const std::string &s, bool *changed = nullptr) {
+  std::string out;
+  bool any = false;
+  size_t i = 0;
+  while (i < s.size()) {
+    std::string as;
+    size_t after;
+    if (matchPtrType(s, i, as, after)) {
+      out += typedPointer("i8", as);
+      i = after;
+      any = true;
+      continue;
+    }
+    out += s[i];
+    i++;
+  }
+  if (changed)
+    *changed = any;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Floating point literals. LLVM 23 prints them in forms the IR parser in
+// air-as rejects: the shortest decimal that round-trips in the type (0.1f as
+// "1.000000e-01", which an old parser refuses as inexact), "f0x<bits>" for
+// floats, and "+inf", "-qnan", "+nan(0x..)", "+snan(0x..)". Rewrite those the
+// way LLVM 22 printed them: a float as the hex of the equal double, a double as
+// its bits, half as 0xH and bfloat as 0xR. Exact decimals are left alone.
+
+const llvm::fltSemantics *fpSemantics(const std::string &type) {
+  if (type == "half")
+    return &llvm::APFloat::IEEEhalf();
+  if (type == "bfloat")
+    return &llvm::APFloat::BFloat();
+  if (type == "float")
+    return &llvm::APFloat::IEEEsingle();
+  if (type == "double")
+    return &llvm::APFloat::IEEEdouble();
+  return nullptr;
+}
+
+std::string legacyFPLiteral(const llvm::APFloat &value, const std::string &type) {
+  char buf[32];
+  if (type == "half" || type == "bfloat") {
+    snprintf(buf, sizeof(buf), type == "half" ? "0xH%04llX" : "0xR%04llX",
+             (unsigned long long)value.bitcastToAPInt().getZExtValue());
+    return buf;
+  }
+  llvm::APFloat apf = value;
+  if (type == "float") {
+    // As LLVM 22's AsmWriter: a signaling NaN is quieted by the conversion,
+    // so rebuild it from the converted bits.
+    bool snan = apf.isSignaling(), ignored;
+    apf.convert(llvm::APFloat::IEEEdouble(), llvm::APFloat::rmNearestTiesToEven, &ignored);
+    if (snan) {
+      llvm::APInt payload = apf.bitcastToAPInt();
+      apf = llvm::APFloat::getSNaN(llvm::APFloat::IEEEdouble(), apf.isNegative(), &payload);
+    }
+  }
+  snprintf(buf, sizeof(buf), "0x%016llX", (unsigned long long)apf.bitcastToAPInt().getZExtValue());
+  return buf;
+}
+
+// Reads one floating point literal of the given type at s[pos]. Sets keep when
+// the text is a decimal an old parser takes as is.
+bool readFPLiteral(const std::string &s, size_t pos, const std::string &type,
+                   llvm::APFloat &value, size_t &end, bool &keep) {
+  const llvm::fltSemantics &sem = *fpSemantics(type);
+  unsigned bits = llvm::APFloat::getSizeInBits(sem);
+  size_t i = pos;
+  bool neg = false;
+  keep = false;
+
+  auto hexRun = [&](size_t from, size_t &to) {
+    to = from;
+    while (to < s.size() && std::isxdigit((unsigned char)s[to]))
+      to++;
+    return to > from;
+  };
+
+  if (s.compare(i, 3, "f0x") == 0) {
+    size_t e;
+    if (!hexRun(i + 3, e))
+      return false;
+    value = llvm::APFloat(sem, llvm::APInt(bits, s.substr(i + 3, e - i - 3), 16));
+    end = e;
+    return true;
+  }
+  if (s[i] == '+' || s[i] == '-') {
+    neg = s[i] == '-';
+    i++;
+    if (s.compare(i, 3, "inf") == 0) {
+      value = llvm::APFloat::getInf(sem, neg);
+      end = i + 3;
+      return true;
+    }
+    if (s.compare(i, 4, "qnan") == 0) {
+      value = llvm::APFloat::getQNaN(sem, neg);
+      end = i + 4;
+      return true;
+    }
+    bool snan = s.compare(i, 5, "snan(") == 0;
+    if (snan || s.compare(i, 4, "nan(") == 0) {
+      size_t h = i + (snan ? 5 : 4), e;
+      if (s.compare(h, 2, "0x") != 0 || !hexRun(h + 2, e) || e >= s.size() || s[e] != ')')
+        return false;
+      llvm::APInt payload(bits, s.substr(h + 2, e - h - 2), 16);
+      value = snan ? llvm::APFloat::getSNaN(sem, neg, &payload) : llvm::APFloat::getQNaN(sem, neg, &payload);
+      end = e + 1;
+      return true;
+    }
+  }
+
+  // [-+]digits.digits e[-+]digits, as LLVM prints decimals
+  size_t d = i;
+  while (d < s.size() && std::isdigit((unsigned char)s[d]))
+    d++;
+  if (d == i || d >= s.size() || s[d] != '.')
+    return false;
+  size_t f = ++d;
+  while (d < s.size() && std::isdigit((unsigned char)s[d]))
+    d++;
+  if (d == f || d + 1 >= s.size() || (s[d] != 'e' && s[d] != 'E') || (s[d + 1] != '+' && s[d + 1] != '-'))
+    return false;
+  size_t x = d += 2;
+  while (d < s.size() && std::isdigit((unsigned char)s[d]))
+    d++;
+  if (d == x)
+    return false;
+  std::string text = s.substr(pos, d - pos);
+  auto parse = [&](llvm::APFloat &v) {
+    auto status = v.convertFromString(text, llvm::APFloat::rmNearestTiesToEven);
+    if (status)
+      return true;
+    llvm::consumeError(status.takeError());
+    return false;
+  };
+  value = llvm::APFloat(sem);
+  if (!parse(value))
+    return false;
+  // An old parser reads the decimal as a double and refuses it unless the
+  // type holds that double exactly; doubles are always fine.
+  llvm::APFloat asDouble(llvm::APFloat::IEEEdouble());
+  bool lost = false;
+  if (parse(asDouble))
+    asDouble.convert(sem, llvm::APFloat::rmNearestTiesToEven, &lost);
+  keep = type == "double" || !lost;
+  end = d;
+  return true;
+}
+
+// The scalar type of the operands of an fadd/fsub/fmul/fdiv/frem/fneg/fcmp/phi
+// on this line (the element type for vectors), whose constant operands are not
+// preceded by their type.
+std::string fpOperandType(const std::string &line) {
+  static const char *const ops[] = {"fadd ", "fsub ", "fmul ", "fdiv ", "frem ", "fneg ", "fcmp ", "phi "};
+  static const char *const flags[] = {"nnan", "ninf", "nsz", "arcp", "contract", "afn", "reassoc", "fast"};
+  size_t eq = line.find(" = ");
+  size_t p = eq == std::string::npos ? line.find_first_not_of(" \t") : eq + 3;
+  if (p == std::string::npos)
+    return {};
+  const char *op = nullptr;
+  for (const char *o : ops)
+    if (line.compare(p, std::strlen(o), o) == 0)
+      op = o;
+  if (!op)
+    return {};
+  p += std::strlen(op);
+  for (bool more = true; more;) {
+    more = false;
+    for (const char *fl : flags) {
+      size_t n = std::strlen(fl);
+      if (line.compare(p, n, fl) == 0 && p + n < line.size() && line[p + n] == ' ') {
+        p += n + 1;
+        more = true;
+      }
+    }
+  }
+  if (!std::strcmp(op, "fcmp ")) {  // the predicate
+    p = line.find(' ', p);
+    if (p == std::string::npos)
+      return {};
+    p++;
+  }
+  if (line.compare(p, 1, "<") == 0) {  // <N x type>
+    size_t x = line.find(" x ", p);
+    if (x == std::string::npos)
+      return {};
+    p = x + 3;
+  }
+  for (const char *t : {"half", "bfloat", "float", "double"})
+    if (line.compare(p, std::strlen(t), t) == 0)
+      return t;
+  return {};
+}
+
+std::string downgradeFPLiterals(const std::string &line) {
+  std::string out;
+  std::string lineType;
+  bool lineTypeKnown = false, quoted = false;
+
+  for (size_t i = 0; i < line.size();) {
+    char c = line[i];
+    if (c == '"')
+      quoted = !quoted;
+    bool boundary = i == 0 || std::strchr(" <[(,", line[i - 1]);
+    if (quoted || !boundary || !(std::isdigit((unsigned char)c) || c == '+' || c == '-' || c == 'f')) {
+      out += c;
+      i++;
+      continue;
+    }
+
+    // The type is the keyword right before the literal, else the operand
+    // type of the instruction.
+    std::string type;
+    size_t k = out.find_last_not_of(' ');
+    if (k != std::string::npos) {
+      size_t b = out.find_last_of(" <[(,", k);
+      std::string prev = out.substr(b == std::string::npos ? 0 : b + 1, k - (b == std::string::npos ? 0 : b + 1) + 1);
+      if (fpSemantics(prev))
+        type = prev;
+    }
+    if (type.empty()) {
+      if (!lineTypeKnown) {
+        lineType = fpOperandType(line);
+        lineTypeKnown = true;
+      }
+      type = lineType;
+    }
+
+    llvm::APFloat value(0.0);
+    size_t end;
+    bool keep;
+    if (!type.empty() && readFPLiteral(line, i, type, value, end, keep) &&
+        (end == line.size() || std::strchr(" ,>])", line[end]))) {
+      if (keep)
+        out.append(line, i, end - i);
+      else
+        out += legacyFPLiteral(value, type);
+      i = end;
+      continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
 }
 
 } // namespace
@@ -335,6 +667,39 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
   for (auto &l : lines)
     l = stripGepFlags(l);
 
+  // Declared value type of every module-level global ("@name" -> type), read
+  // from its "@name = ... global|constant <type> ..." declaration line. Used
+  // so references to a global at an unrelated pointee type (e.g. a threadgroup
+  // counter passed to a linked-in helper function that expects a byte
+  // pointer) get an explicit bitcast instead of a bare mismatched operand,
+  // which Apple's air-as rejects outright.
+  std::map<std::string, std::string> globalScalarType;
+  for (const std::string &line : lines) {
+    std::string t = trim(line);
+    if (t.empty() || t[0] != '@')
+      continue;
+    size_t eq = t.find(" = ");
+    if (eq == std::string::npos)
+      continue;
+    std::string name = t.substr(0, eq);
+    size_t gp = t.find(" global ", eq);
+    size_t cp = t.find(" constant ", eq);
+    size_t kw = std::string::npos, kwLen = 0;
+    if (gp != std::string::npos && (cp == std::string::npos || gp < cp)) {
+      kw = gp;
+      kwLen = std::strlen(" global ");
+    } else if (cp != std::string::npos) {
+      kw = cp;
+      kwLen = std::strlen(" constant ");
+    }
+    if (kw == std::string::npos)
+      continue;
+    size_t e;
+    std::string ty = readFullType(t, kw + kwLen, e);
+    if (!ty.empty())
+      globalScalarType[name] = ty;
+  }
+
   std::map<std::string, std::vector<std::string>> argBufferFieldOverrides;
   std::map<int, std::string> argBufferInputStructs;
   std::map<std::string, std::string> metadataLines;
@@ -346,6 +711,42 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
         metadataLines[t.substr(0, eq)] = t;
     }
   }
+
+  // Function(s) actually exported as a shader stage entry point (air.vertex /
+  // air.fragment / air.kernel / air.object / air.mesh). argBufferInputStructs
+  // below records "parameter index -> struct type" purely by index, meaning
+  // it must only ever be applied when rewriting one of THESE functions'
+  // signature - applying it to any other `define` in the module (e.g. a
+  // tessellation/MSAD helper linked in from a separate .metal file, whose
+  // unrelated parameter happens to share the same index) corrupts that
+  // helper's signature and produces a type mismatch air-as rejects.
+  std::set<std::string> entryPointFunctions;
+  for (const char *kind :
+       {"air.vertex", "air.fragment", "air.kernel", "air.object", "air.mesh"}) {
+    auto it = metadataLines.find(std::string("!") + kind);
+    if (it == metadataLines.end())
+      continue;
+    const std::string &line = it->second;
+    size_t p = 0;
+    while ((p = line.find('!', p + 1)) != std::string::npos) {
+      size_t e = p + 1;
+      while (e < line.size() && std::isdigit((unsigned char)line[e]))
+        e++;
+      if (e == p + 1)
+        continue;
+      auto ref = metadataLines.find(line.substr(p, e - p));
+      if (ref == metadataLines.end())
+        continue;
+      size_t fp = ref->second.find("ptr @");
+      if (fp == std::string::npos)
+        continue;
+      size_t ne;
+      std::string fn = readValueName(ref->second, fp + 4, ne);
+      if (!fn.empty())
+        entryPointFunctions.insert(fn.substr(1));
+    }
+  }
+
   for (const auto &[id, line] : metadataLines) {
     if (line.find("!\"air.indirect_buffer\"") == std::string::npos ||
         line.find("!\"air.struct_type_info\"") == std::string::npos ||
@@ -381,7 +782,11 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
     if (it == metadataLines.end())
       continue;
     std::string info = it->second;
+    /* One field per "air.indirect_argument" entry. A field whose type cannot
+     * be told leaves the struct as LLVM wrote it: dropping it would move every
+     * field after it. */
     std::vector<std::string> fields;
+    bool complete = true;
     size_t p = 0;
     while ((p = info.find("!\"", p)) != std::string::npos) {
       p += 2;
@@ -389,16 +794,26 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
       if (e == std::string::npos)
         break;
       std::string typeName = info.substr(p, e - p);
-      std::string fieldType = airArgTypeToLLVMFieldType(typeName);
-      if (!fieldType.empty())
-        fields.push_back(fieldType);
-      p = e + 1;
-      size_t next = info.find("!\"air.indirect_argument\"", p);
+      size_t next = info.find("!\"air.indirect_argument\"", e);
       if (next == std::string::npos)
         break;
+      std::string argNode;
+      size_t ref = info.find('!', next + 1);
+      if (ref != std::string::npos) {
+        size_t refEnd = ref + 1;
+        while (refEnd < info.size() && std::isdigit((unsigned char)info[refEnd]))
+          refEnd++;
+        auto node = metadataLines.find(info.substr(ref, refEnd - ref));
+        if (node != metadataLines.end())
+          argNode = node->second;
+      }
+      std::string fieldType = airArgumentFieldType(argNode, typeName);
+      if (fieldType.empty())
+        complete = false;
+      fields.push_back(fieldType);
       p = next + 1;
     }
-    if (!fields.empty())
+    if (!fields.empty() && complete)
       argBufferFieldOverrides[structName] = fields;
     if (inputIndex >= 0)
       argBufferInputStructs[inputIndex] = structName;
@@ -418,6 +833,25 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
         }
         rebuilt += " }";
         line = leadingWhitespace(line) + rebuilt;
+      } else {
+        size_t ob = t.find('{');
+        size_t cb = t.rfind('}');
+        if (ob != std::string::npos && cb != std::string::npos && cb > ob) {
+          auto fields = splitTopLevel(t.substr(ob + 1, cb - ob - 1));
+          bool changed = false;
+          std::string rebuilt = name + " = type { ";
+          for (size_t i = 0; i < fields.size(); i++) {
+            bool fieldChanged = false;
+            std::string field = downgradeOpaquePtrTokens(trim(fields[i]), &fieldChanged);
+            changed |= fieldChanged;
+            if (i)
+              rebuilt += ", ";
+            rebuilt += field;
+          }
+          rebuilt += " }";
+          if (changed)
+            line = leadingWhitespace(line) + rebuilt;
+        }
       }
     }
   }
@@ -535,6 +969,22 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
         e++;
       s.erase(cp, e - cp);
     }
+    // `range(i32 lo, hi)` on a return value or parameter: newer than air-as,
+    // and only an optimisation hint.
+    size_t rp = 0;
+    while ((rp = s.find("range(", rp)) != std::string::npos) {
+      if (rp && s[rp - 1] != ' ' && s[rp - 1] != '(') {
+        rp += 6;
+        continue;
+      }
+      size_t close = s.find(')', rp);
+      if (close == std::string::npos)
+        break;
+      size_t e = close + 1;
+      if (e < s.size() && s[e] == ' ')
+        e++;
+      s.erase(rp, e - rp);
+    }
     return s;
   };
 
@@ -596,20 +1046,7 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
   // (N)]*". Used for instructions that do not impose a specific pointee type
   // (icmp, phi, select, ptrtoint, br, ret, ...).
   auto genericI8 = [&](std::string s) -> std::string {
-    std::string o;
-    size_t i = 0;
-    while (i < s.size()) {
-      std::string as;
-      size_t after;
-      if (matchPtrType(s, i, as, after)) {
-        o += typedPointer("i8", as);
-        i = after;
-        continue;
-      }
-      o += s[i];
-      i++;
-    }
-    return o;
+    return downgradeOpaquePtrTokens(s);
   };
 
   // Emit a pointer operand of the required pointee type. Locals are byte
@@ -621,10 +1058,21 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
     std::string typ = typedPointer(pointee, as);
     if (isOpaqueHandle(pointee))
       neededOpaqueStructs.insert(pointee);
-    if (nm.empty() || nm[0] == '@')
-      return {typ, nm}; // globals carry their declared type
-    auto it = cano.find(nm);
-    std::string from = it != cano.end() ? it->second : typedPointer("i8", as);
+    if (nm.empty())
+      return {typ, nm};
+    std::string from;
+    if (nm[0] == '@') {
+      // A global's operand type must match its own declaration; if the
+      // expected pointee differs, bitcast rather than emitting a mismatched
+      // type (air-as validates operand types against the global's real type).
+      auto git = globalScalarType.find(nm);
+      if (git == globalScalarType.end())
+        return {typ, nm}; // not a variable we tracked (e.g. a function ref)
+      from = typedPointer(git->second, as);
+    } else {
+      auto it = cano.find(nm);
+      from = it != cano.end() ? it->second : typedPointer("i8", as);
+    }
     if (from == typ)
       return {typ, nm}; // already the right type
     std::string tmp = fresh();
@@ -678,7 +1126,7 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
         size_t after;
         if (pp != std::string::npos && matchPtrType(a, pp, as, after)) {
           std::string pointee = airFn ? airIntrinsicArgPointee(fn, (int)i) : "";
-          if (!airFn) {
+          if (!airFn && entryPointFunctions.count(fn)) {
             auto ab = argBufferInputStructs.find((int)i);
             if (ab != argBufferInputStructs.end())
               pointee = ab->second;
@@ -728,6 +1176,7 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
     if (lpos != std::string::npos && line.find("call") == std::string::npos) {
       std::string lhs = trim(line.substr(0, lpos));
       size_t p = lpos + std::strlen(" = load ");
+      std::string quals = readMemoryQualifiers(line, p);
       size_t e;
       std::string acc = readFullType(line, p, e);
       if (argBufferFieldOverrides.count(acc)) {
@@ -760,7 +1209,7 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
                              acc + ", " + typedPointer(acc, as) + " " + nm +
                              ", i32 0, i32 0");
             std::string fieldPtr = typedPointer((*fields)[0], as);
-            result.push_back(indent + lhs + " = load " + (*fields)[0] +
+            result.push_back(indent + lhs + " = load " + quals + (*fields)[0] +
                              ", " + fieldPtr + " " + gep + rest);
             cano[lhs] = (*fields)[0];
             return;
@@ -800,7 +1249,7 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
                                argStruct + ", " + typedPointer(argStruct, as) +
                                " " + nm + ", i32 0, i32 0");
               std::string fieldPtr = typedPointer((*fields)[0], as);
-              result.push_back(indent + lhs + " = load " + (*fields)[0] +
+              result.push_back(indent + lhs + " = load " + quals + (*fields)[0] +
                                ", " + fieldPtr + " " + gep + rest);
               cano[lhs] = (*fields)[0];
               return;
@@ -817,7 +1266,7 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
         // if the loaded value is itself a pointer, track its type
         if (startsWith(acc, "ptr"))
           cano[lhs] = accType;
-        result.push_back(indent + lhs + " = load " + accType + ", " + pr.first +
+        result.push_back(indent + lhs + " = load " + quals + accType + ", " + pr.first +
                          " " + pr.second + rest);
         return;
       }
@@ -827,6 +1276,7 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
     if (startsWith(t, "store ")) {
       size_t sp = line.find("store ");
       size_t p = sp + std::strlen("store ");
+      std::string quals = readMemoryQualifiers(line, p);
       size_t e;
       std::string vt = readFullType(line, p, e);
       size_t pp = line.find("ptr", e);
@@ -844,9 +1294,39 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
         std::string vType =
             startsWith(vt, "ptr") ? typedPointer("i8", addrspaceOf(vt)) : vt;
         auto pr = emitPtrOperand(vType, as, nm, indent, result);
-        result.push_back(indent + "store " + vType + valText + ", " + pr.first +
+        result.push_back(indent + "store " + quals + vType + valText + ", " + pr.first +
                          " " + pr.second + rest);
         return;
+      }
+    }
+
+    // cmpxchg / atomicrmw: the pointer operand points at the value type.
+    //   %R = cmpxchg [weak] [volatile] ptr<as> %p, T %cmp, T %new <rest>
+    //   %R = atomicrmw [volatile] OP ptr<as> %p, T %v <rest>
+    {
+      size_t kw = line.find(" = cmpxchg ");
+      size_t kwlen = std::strlen(" = cmpxchg ");
+      if (kw == std::string::npos) {
+        kw = line.find(" = atomicrmw ");
+        kwlen = std::strlen(" = atomicrmw ");
+      }
+      size_t pp = kw == std::string::npos ? std::string::npos : line.find("ptr", kw + kwlen);
+      std::string as;
+      size_t after;
+      if (pp != std::string::npos && matchPtrType(line, pp, as, after)) {
+        size_t q = after;
+        while (q < line.size() && std::isspace((unsigned char)line[q]))
+          q++;
+        size_t ne;
+        std::string nm = readValueName(line, q, ne);
+        size_t comma = line.find(',', ne);
+        size_t te;
+        std::string vt = comma == std::string::npos ? "" : readFullType(line, comma + 1, te);
+        if (!nm.empty() && !vt.empty() && !startsWith(vt, "ptr")) {
+          auto pr = emitPtrOperand(vt, as, nm, indent, result);
+          result.push_back(line.substr(0, pp) + pr.first + " " + pr.second + line.substr(ne));
+          return;
+        }
       }
     }
 
@@ -895,23 +1375,36 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
       }
     }
 
-    // air intrinsic call: bitcast handle / element pointer arguments.
-    if (t.find("call ") != std::string::npos &&
-        t.find("@air.") != std::string::npos) {
-      size_t atp = line.find("@air.");
-      std::string fn = funcNameOf(line, atp - 1);
-      size_t op = line.find('(', atp);
+    // Direct call (air intrinsic, or a helper function linked in from a
+    // separately-compiled .metal module, e.g. air_tessellation.metal): bitcast
+    // handle / element / global pointer arguments to what the callee expects.
+    // Only direct calls (`@name(`) are handled here; indirect calls fall
+    // through to the generic i8* pass below.
+    if (t.find("call ") != std::string::npos) {
+      size_t atp = std::string::npos;
+      for (size_t search = 0; (search = line.find('@', search)) != std::string::npos; search++) {
+        size_t ne;
+        std::string cand = readValueName(line, search, ne);
+        if (!cand.empty() && ne < line.size() && line[ne] == '(') {
+          atp = search;
+          break;
+        }
+      }
+      size_t op = atp == std::string::npos ? std::string::npos : line.find('(', atp);
+      std::string fn = atp == std::string::npos ? "" : funcNameOf(line, atp);
       // matching close paren
-      int depth = 0;
       size_t cl = std::string::npos;
-      for (size_t i = op; i < line.size(); i++) {
-        if (line[i] == '(')
-          depth++;
-        else if (line[i] == ')') {
-          depth--;
-          if (depth == 0) {
-            cl = i;
-            break;
+      if (op != std::string::npos) {
+        int depth = 0;
+        for (size_t i = op; i < line.size(); i++) {
+          if (line[i] == '(')
+            depth++;
+          else if (line[i] == ')') {
+            depth--;
+            if (depth == 0) {
+              cl = i;
+              break;
+            }
           }
         }
       }
@@ -960,7 +1453,37 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
       return;
     }
 
-    // everything else: retype any pointer tokens to i8*.
+    // everything else: retype any pointer tokens to i8*. A pointer operand
+    // already typed otherwise -- a GEP's result, a loaded argument field --
+    // is cast to the byte pointer first; cano holds only pointers, so any
+    // operand it knows is one. (Not into a phi: the cast would have to go
+    // into the predecessor.)
+    if (t.find(" = phi ") == std::string::npos) {
+      std::string fixed = line;
+      size_t eq = fixed.find(" = ");
+      size_t pos = eq == std::string::npos ? 0 : eq + 3;
+      while ((pos = fixed.find('%', pos)) != std::string::npos) {
+        size_t ne;
+        std::string nm = readValueName(fixed, pos, ne);
+        if (nm.empty() || ne <= pos) {
+          pos++;
+          continue;
+        }
+        auto it = cano.find(nm);
+        if (it != cano.end()) {
+          std::string bytePtr = typedPointer("i8", typedPointerAddrspace(it->second));
+          if (it->second != bytePtr) {
+            std::string tmp = fresh();
+            result.push_back(indent + tmp + " = bitcast " + it->second + " " + nm + " to " + bytePtr);
+            fixed.replace(pos, ne - pos, tmp);
+            ne = pos + tmp.size();
+          }
+        }
+        pos = ne;
+      }
+      result.push_back(genericI8(fixed));
+      return;
+    }
     result.push_back(genericI8(line));
   };
 
@@ -1059,6 +1582,18 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
     }
   }
 
+  // Opaque handle types referenced only as argument-buffer struct fields
+  // (never as an intrinsic argument) still need a declaration.
+  for (const auto &[name, fields] : argBufferFieldOverrides) {
+    (void)name;
+    for (const auto &f : fields) {
+      if (f.rfind("%struct._", 0) == 0) {
+        size_t e = f.find(' ');
+        neededOpaqueStructs.insert(e == std::string::npos ? f : f.substr(0, e));
+      }
+    }
+  }
+
   // ---- inject opaque struct declarations after target triple -----------
   std::vector<std::string> finalLines;
   finalLines.reserve(result.size() + 8);
@@ -1086,7 +1621,7 @@ bool DowngradeToAppleAIR(const std::string &in, std::string &out,
 
   std::ostringstream os;
   for (const auto &l : finalLines)
-    os << l << "\n";
+    os << downgradeFPLiterals(l) << "\n";
   out = os.str();
   (void)err;
   return true;

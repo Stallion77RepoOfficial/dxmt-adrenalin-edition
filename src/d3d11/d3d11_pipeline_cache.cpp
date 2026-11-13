@@ -1,4 +1,5 @@
 #include "d3d11_pipeline_cache.hpp"
+#include "util_env.hpp"
 #include "airconv_public.h"
 #include "d3d11_device.hpp"
 #include "d3d11_shader.hpp"
@@ -13,6 +14,12 @@
 #include <shared_mutex>
 
 namespace dxmt {
+/* DXMT_FPS=1 reports these: a graphics pipeline that had to be built rather
+ * than found in the cache. Each one is a Metal pipeline compile, tens of
+ * milliseconds, and a game that misses on every draw cannot run at speed
+ * however fast everything else is. */
+static uint64_t g_pipeline_misses = 0;
+static const bool g_report_pipelines = env::getEnvVar("DXMT_FPS") == "1";
 
 class MTLD3D11InputLayout final
     : public MTLD3D11DeviceChild<IMTLD3D11InputLayout> {
@@ -190,8 +197,6 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
 
   ShaderCache& scache_;
 
-  task_scheduler<ThreadpoolWork *> scheduler_;
-
   MTLD3D11Device *device;
   StateObjectCache<D3D11_BLEND_DESC1, IMTLD3D11BlendState> blend_states;
 
@@ -216,6 +221,13 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
 
   std::unordered_map<ManagedShader, std::unique_ptr<MTLCompiledComputePipeline>> pipelines_cs_;
   dxmt::mutex mutex_cs_;
+
+  /* Declared last so it is destroyed first: its destructor joins the worker
+   * threads, and a running compile task holds raw pointers into shaders_ and
+   * the pipeline maps. Declared ahead of them, the maps were freed while
+   * workers still ran -- a device torn down with compilation in flight jumped
+   * through a freed vtable (Wine's d3d9 visual suite, at its first device). */
+  task_scheduler<ThreadpoolWork *> scheduler_;
 
   CachedSM50Shader *CreateShader(const void *pBytecode,
                                  uint32_t BytecodeLength) {
@@ -385,6 +397,8 @@ class PipelineCache : public MTLD3D11PipelineCacheBase {
       *ppPipeline = iter->second.get();
       return;
     }
+    if (g_report_pipelines && (++g_pipeline_misses % 25) == 0)
+      Logger::info(str::format("graphics pipelines built so far: ", g_pipeline_misses));
     auto [iter, inserted] = pipelines_.insert({*pDesc, CreateGraphicsPipeline(device, pDesc)});
     if (!inserted) {
       D3D11_ASSERT(0 && "duplicated graphics pipeline");

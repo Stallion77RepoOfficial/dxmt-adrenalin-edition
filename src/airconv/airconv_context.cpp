@@ -4,6 +4,8 @@
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/ReplaceConstant.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/VersionTuple.h"
@@ -157,6 +159,20 @@ runOptimizationPasses(llvm::Module &M) {
 
   // Optimize the IR!
   MPM.run(M, MAM);
+
+  // InstCombine folds accesses at constant threadgroup offsets into constant
+  // GEP expressions. The AIR pointer downgrade reconstructs types on
+  // instructions, so expose these operands as instructions too. LLVM handles
+  // nested expressions and PHI predecessors without changing their meaning.
+  SmallPtrSet<Constant *, 16> expressions;
+  for (auto &function : M)
+    for (auto &block : function)
+      for (auto &instruction : block)
+        for (auto &operand : instruction.operands())
+          if (auto *expression = dyn_cast<ConstantExpr>(operand.get()))
+            expressions.insert(expression);
+  SmallVector<Constant *, 16> constants(expressions.begin(), expressions.end());
+  convertUsersOfConstantsToInstructions(constants, nullptr, true, true);
 }
 
 void

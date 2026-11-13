@@ -15,7 +15,7 @@ template <> UINT BufferBindFlag<IDirect3DIndexBuffer9>()  { return D3D11_BIND_IN
 template <typename Interface, typename DescType>
 D3D9Buffer<Interface, DescType>::D3D9Buffer(
     D3D9Device *pDevice, UINT Length, DWORD Usage, D3DPOOL Pool, const DescType &Desc)
-    : device_(pDevice), length_(Length), desc_(Desc) {
+    : D3D9DeviceChild<Interface>(pDevice), length_(Length), desc_(Desc) {
   // DYNAMIC is only honoured for the default pool; managed/system buffers live
   // in their CPU shadow and are uploaded with UpdateSubresource.
   dynamic_ = (Usage & D3DUSAGE_DYNAMIC) && Pool == D3DPOOL_DEFAULT;
@@ -35,20 +35,21 @@ D3D9Buffer<Interface, DescType>::D3D9Buffer(
     bd.CPUAccessFlags = 0;
   }
 
-  device_->GetD3D11Device()->CreateBuffer(&bd, nullptr, &buffer_);
+  this->device_->GetD3D11Device()->CreateBuffer(&bd, nullptr, &buffer_);
 }
 
 template <typename Interface, typename DescType>
 HRESULT STDMETHODCALLTYPE
 D3D9Buffer<Interface, DescType>::GetDevice(IDirect3DDevice9 **ppDevice) {
   if (!ppDevice) return D3DERR_INVALIDCALL;
-  *ppDevice = ref(device_);
+  *ppDevice = ref(this->device_);
   return D3D_OK;
 }
 
 template <typename Interface, typename DescType>
 HRESULT STDMETHODCALLTYPE
 D3D9Buffer<Interface, DescType>::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWORD Flags) {
+  auto device_lock = this->device_->LockDevice();
   if (!ppbData) return D3DERR_INVALIDCALL;
   if (locked_)  return D3DERR_INVALIDCALL;
 
@@ -70,6 +71,7 @@ D3D9Buffer<Interface, DescType>::Lock(UINT OffsetToLock, UINT SizeToLock, void *
 template <typename Interface, typename DescType>
 HRESULT STDMETHODCALLTYPE
 D3D9Buffer<Interface, DescType>::Unlock() {
+  auto device_lock = this->device_->LockDevice();
   if (!locked_) return D3DERR_INVALIDCALL;
   locked_ = false;
 
@@ -77,7 +79,7 @@ D3D9Buffer<Interface, DescType>::Unlock() {
   if (lock_flags_ & D3DLOCK_READONLY)
     return D3D_OK;
 
-  auto *ctx = device_->GetD3D11Context();
+  auto *ctx = this->device_->GetD3D11Context();
 
   if (dynamic_) {
     // DISCARD / NO_OVERWRITE map straight onto the D3D11 dynamic-buffer hints.

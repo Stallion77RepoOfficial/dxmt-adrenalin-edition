@@ -379,32 +379,23 @@ void setup_metal_version(llvm::Module &module, SM50_SHADER_METAL_VERSION metal_v
   };
   auto createString = [&](auto s) { return MDString::get(context, s); };
 
+  // This toolchain targets a single output dialect: AIR 2.8 / Metal 4.0. The
+  // module is produced by LLVM 22, then assembled through Apple's air-as so the
+  // final AIR bitcode uses the format accepted by AGX. The helper .metal modules
+  // that get linked in (air_msad, air_tessellation, ...) are compiled with
+  // -std=metal4.0 --target=air64-apple-macos26.0, so every shader must declare
+  // the same versions to link cleanly.
+  (void)metal_version;
   auto airVersion = module.getOrInsertNamedMetadata("air.version");
   auto airLangVersion = module.getOrInsertNamedMetadata("air.language_version");
-  switch (metal_version) {
-  case SM50_SHADER_METAL_320: {
-    // Match the system Metal 4 frontend output for this toolchain. The module
-    // is produced by LLVM 22, then assembled through Apple's air-as so the final
-    // AIR bitcode uses the format accepted by AGX.
-    airVersion->addOperand(
-        MDTuple::get(context, {createUnsignedInteger(2), createUnsignedInteger(8), createUnsignedInteger(0)})
-    );
-    airLangVersion->addOperand(MDTuple::get(
-        context, {createString("Metal"), createUnsignedInteger(4), createUnsignedInteger(0), createUnsignedInteger(0)}
-    ));
-    module.setTargetTriple(llvm::Triple("air64-apple-macosx26.0.0"));
-    break;
-  }
-  default: {
-    airVersion->addOperand(
-        MDTuple::get(context, {createUnsignedInteger(2), createUnsignedInteger(8), createUnsignedInteger(0)})
-    );
-    airLangVersion->addOperand(MDTuple::get(
-        context, {createString("Metal"), createUnsignedInteger(4), createUnsignedInteger(0), createUnsignedInteger(0)}
-    ));
-    break;
-  }
-  }
+  airVersion->addOperand(MDTuple::get(
+      context, {createUnsignedInteger(2), createUnsignedInteger(8), createUnsignedInteger(0)}
+  ));
+  airLangVersion->addOperand(MDTuple::get(
+      context, {createString("Metal"), createUnsignedInteger(4), createUnsignedInteger(0),
+                createUnsignedInteger(0)}
+  ));
+  module.setTargetTriple(llvm::Triple("air64-apple-macosx26.0.0"));
 }
 
 llvm::Error convert_dxbc_pixel_shader(
@@ -1054,20 +1045,6 @@ AIRCONV_API int SM50Initialize(
     return 1;
   }
 
-  if (getenv("DXMT_AIR_DEBUG_DUMP")) {
-    static int dxbcSaved = 0;
-    if (dxbcSaved < 24) {
-      int n = dxbcSaved++;
-      system("/bin/mkdir -p /tmp/dxmt_dxbc 2>/dev/null");
-      char p[128];
-      snprintf(p, sizeof(p), "/tmp/dxmt_dxbc/shader_%d.dxbc", n);
-      if (FILE *f = fopen(p, "wb")) {
-        fwrite(pBytecode, 1, BytecodeSize, f);
-        fclose(f);
-      }
-    }
-  }
-
   CDXBCParser DXBCParser;
   if (DXBCParser.ReadDXBC(pBytecode, BytecodeSize) != S_OK) {
     errorOut << "Invalid DXBC bytecode\0";
@@ -1458,7 +1435,13 @@ AIRCONV_API int SM50Compile(
 
   metallib::MetallibWriter writer;
 
-  writer.Write(*pModule, OS);
+  std::string why;
+  if (!writer.Write(*pModule, OS, &why)) {
+    delete compiled;
+    errorOut << "air-as failed to assemble the shader module: " << why;
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
 
   pModule.reset();
 
@@ -1521,7 +1504,13 @@ AIRCONV_API int SM50CompileTessellationPipelineHull(
 
   metallib::MetallibWriter writer;
 
-  writer.Write(*pModule, OS);
+  std::string why;
+  if (!writer.Write(*pModule, OS, &why)) {
+    delete compiled;
+    errorOut << "air-as failed to assemble the shader module: " << why;
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
 
   pModule.reset();
 
@@ -1585,7 +1574,13 @@ AIRCONV_API int SM50CompileTessellationPipelineDomain(
 
   metallib::MetallibWriter writer;
 
-  writer.Write(*pModule, OS);
+  std::string why;
+  if (!writer.Write(*pModule, OS, &why)) {
+    delete compiled;
+    errorOut << "air-as failed to assemble the shader module: " << why;
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
 
   pModule.reset();
 
@@ -1647,7 +1642,13 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
 
   metallib::MetallibWriter writer;
 
-  writer.Write(*pModule, OS);
+  std::string why;
+  if (!writer.Write(*pModule, OS, &why)) {
+    delete compiled;
+    errorOut << "air-as failed to assemble the shader module: " << why;
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
 
   pModule.reset();
 
@@ -1710,7 +1711,13 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
 
   metallib::MetallibWriter writer;
 
-  writer.Write(*pModule, OS);
+  std::string why;
+  if (!writer.Write(*pModule, OS, &why)) {
+    delete compiled;
+    errorOut << "air-as failed to assemble the shader module: " << why;
+    *ppError = (sm50_error_t)errorObj;
+    return 1;
+  }
 
   pModule.reset();
 

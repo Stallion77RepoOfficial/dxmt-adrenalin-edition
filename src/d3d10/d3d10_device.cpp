@@ -1000,6 +1000,9 @@ MTLD3D10Device::CreateVertexShader(
 ) {
   InitReturnPtr(ppVertexShader);
 
+  if (!IsShaderModel4OrOlder(pShaderBytecode, BytecodeLength))
+    return E_INVALIDARG;
+
   Com<ID3D11VertexShader> d3d11_shader;
 
   HRESULT hr = d3d11_device_->CreateVertexShader(
@@ -1017,6 +1020,9 @@ MTLD3D10Device::CreateGeometryShader(
     const void *pShaderBytecode, SIZE_T BytecodeLength, ID3D10GeometryShader **ppGeometryShader
 ) {
   InitReturnPtr(ppGeometryShader);
+
+  if (!IsShaderModel4OrOlder(pShaderBytecode, BytecodeLength))
+    return E_INVALIDARG;
 
   Com<ID3D11GeometryShader> d3d11_shader;
 
@@ -1036,6 +1042,9 @@ MTLD3D10Device::CreateGeometryShaderWithStreamOutput(
     UINT NumEntries, UINT OutputStreamStride, ID3D10GeometryShader **ppGeometryShader
 ) {
   InitReturnPtr(ppGeometryShader);
+
+  if (!IsShaderModel4OrOlder(pShaderBytecode, BytecodeLength))
+    return E_INVALIDARG;
 
   std::vector<D3D11_SO_DECLARATION_ENTRY> entries(NumEntries);
 
@@ -1066,6 +1075,9 @@ MTLD3D10Device::CreatePixelShader(
     const void *pShaderBytecode, SIZE_T BytecodeLength, ID3D10PixelShader **ppPixelShader
 ) {
   InitReturnPtr(ppPixelShader);
+
+  if (!IsShaderModel4OrOlder(pShaderBytecode, BytecodeLength))
+    return E_INVALIDARG;
 
   Com<ID3D11PixelShader> d3d11_shader;
 

@@ -188,7 +188,7 @@ else
   windows_native_install_dir = ''
 endif
 
-native_compiler_arch = cpu_family == 'aarch64' ? 'arm64' : 'x86_64'
+native_compiler_arch = build_machine.cpu_family() == 'aarch64' ? 'arm64' : 'x86_64'
 
 add_project_arguments(cpp.get_supported_arguments(compiler_args), language: 'cpp')
 add_project_arguments(clangpp.get_supported_arguments(native_compiler_args), language: 'cpp', native: true)
@@ -200,6 +200,7 @@ if dxmt_crossbuild
   add_project_arguments(['-arch', native_compiler_arch], language: 'c',  native: true)
   add_project_arguments(['-arch', native_compiler_arch], language: 'cpp',  native: true)
   add_project_link_arguments(['-arch', native_compiler_arch], language: 'cpp',  native: true)
+  add_project_link_arguments('-Wl,-headerpad_max_install_names', language: ['c', 'cpp'], native: true)
 endif
 
 subdir('libs')

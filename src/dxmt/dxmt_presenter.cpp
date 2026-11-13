@@ -3,6 +3,7 @@
 #include "Metal.hpp"
 #include "dxmt_format.hpp"
 #include "dxmt_presenter.hpp"
+#include "dxmt_hud_renderer.hpp"
 #include "util_likely.hpp"
 
 
@@ -179,6 +180,20 @@ Presenter::encodeCommands(
   }
   encoder.setViewport({0, 0, width, height, 0, 1});
   encoder.drawPrimitives(WMTPrimitiveTypeTriangle, 0, 3);
+
+  /* The HUD goes into the same drawable pass, on top of the blit. */
+  auto &hud = GetHudContents();
+  bool hud_active;
+  {
+    std::lock_guard<std::mutex> lock(hud.mutex);
+    hud_active = hud.active;
+  }
+  if (hud_active) {
+    if (!hud_renderer_)
+      hud_renderer_ = std::make_unique<HudRenderer>(device_, lib_);
+    hud_renderer_->encode(encoder, layer_props_.pixel_format, width, height);
+  }
+
   update_fences(encoder);
   encoder.endEncoding();
 

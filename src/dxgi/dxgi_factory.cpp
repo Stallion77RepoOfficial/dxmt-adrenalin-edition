@@ -1,3 +1,4 @@
+#include <atomic>
 #include "com/com_pointer.hpp"
 #include "config/config.hpp"
 #include "dxgi_interfaces.h"
@@ -18,10 +19,8 @@ class MTLDXGIFactory : public MTLDXGIObject<IDXGIFactory6> {
 
 public:
   MTLDXGIFactory(UINT Flags) : flags_(Flags) {
-    // Bridge DXMT_HUD (read here from the reliable Windows-side environment) to
-    // the unix-side MTLHUDEnabled before any Metal device is created. The
-    // unix-side constructor reads getenv directly, which under CrossOver does
-    // not always see the variable; this guarantees the Metal HUD turns on.
+    // Bridge the Windows-side DXMT_HUD request to Apple's unix-side Metal HUD
+    // before the Metal device is created.
     auto hud = env::getEnvVar("DXMT_HUD");
     if (!hud.empty() && hud != "0")
       WMT::EnableDeveloperHUD();
@@ -230,38 +229,43 @@ public:
 
   BOOL STDMETHODCALLTYPE IsCurrent() final { return TRUE; }
 
+  /* Occlusion and stereo status registrations succeed and are never
+   * signalled: a Metal layer is never occluded the way a DXGI output is, and
+   * there is no stereo. Refusing them made start-up code that registers
+   * unconditionally take its failure path. */
   HRESULT STDMETHODCALLTYPE RegisterOcclusionStatusWindow(
       HWND WindowHandle, UINT wMsg, DWORD *pdwCookie) final {
-    ERR("Not implemented");
-    return E_NOTIMPL;
+    return RegisterStatus(pdwCookie);
   }
 
   HRESULT STDMETHODCALLTYPE RegisterStereoStatusEvent(HANDLE hEvent,
                                                       DWORD *pdwCookie) final {
-    ERR("Not implemented");
-    return E_NOTIMPL;
+    return RegisterStatus(pdwCookie);
   }
 
   HRESULT STDMETHODCALLTYPE RegisterStereoStatusWindow(HWND WindowHandle,
                                                        UINT wMsg,
                                                        DWORD *pdwCookie) final {
-    ERR("Not implemented");
-    return E_NOTIMPL;
+    return RegisterStatus(pdwCookie);
   }
 
   HRESULT STDMETHODCALLTYPE
   RegisterOcclusionStatusEvent(HANDLE hEvent, DWORD *pdwCookie) final {
-    ERR("Not implemented");
-    return E_NOTIMPL;
+    return RegisterStatus(pdwCookie);
   }
 
-  void STDMETHODCALLTYPE UnregisterStereoStatus(DWORD dwCookie) final {
-    ERR("Not implemented");
+  void STDMETHODCALLTYPE UnregisterStereoStatus(DWORD dwCookie) final {}
+
+  void STDMETHODCALLTYPE UnregisterOcclusionStatus(DWORD dwCookie) final {}
+
+  HRESULT RegisterStatus(DWORD *pdwCookie) {
+    if (!pdwCookie)
+      return DXGI_ERROR_INVALID_CALL;
+    *pdwCookie = ++status_cookie_;
+    return S_OK;
   }
 
-  void STDMETHODCALLTYPE UnregisterOcclusionStatus(DWORD dwCookie) final {
-    ERR("Not implemented");
-  }
+  std::atomic<DWORD> status_cookie_ = 0;
 
   UINT STDMETHODCALLTYPE GetCreationFlags() override { return flags_; }
 

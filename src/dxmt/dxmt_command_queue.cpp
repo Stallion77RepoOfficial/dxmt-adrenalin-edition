@@ -26,6 +26,14 @@
 
 #define ASYNC_ENCODING 1
 
+// How long a committed command buffer may stay un-completed before the GPU is
+// considered hung, mirroring the role of TDR on Windows. Command buffers of a
+// functioning device complete within milliseconds; one that outlives this
+// period will never complete (a GPU fault leaves the buffer in the Error
+// state, which does complete - the stuck-forever case is a wedged compiler
+// service/GPU context).
+static constexpr uint64_t kGPUHangDetectionTimeoutMs = 10'000;
+
 namespace dxmt {
 
 void *
@@ -195,7 +203,25 @@ CommandQueue::WaitForFinishThread() {
       break;
     auto &chunk = chunks[internal_seq % kCommandChunkCount];
     if (chunk.attached_cmdbuf.status() <= WMTCommandBufferStatusScheduled) {
-      chunk.attached_cmdbuf.waitUntilCompleted();
+      if (device_wedged_.load(std::memory_order_relaxed)) {
+        // The device already stopped making progress; drain the remaining
+        // chunks without waiting on it so fences keep advancing and the
+        // process can tear down cleanly.
+      } else if (event.waitUntilSignaledValue(chunk.chunk_event_id, kGPUHangDetectionTimeoutMs)) {
+        // The chunk's trailing GPU command signalled the event, so this
+        // returns immediately; it only synchronizes the status transition.
+        chunk.attached_cmdbuf.waitUntilCompleted();
+      } else if (chunk.attached_cmdbuf.status() <= WMTCommandBufferStatusScheduled) {
+        // A faulted command buffer still completes (with the Error status),
+        // so never completing within the timeout means the device is wedged.
+        // Stop waiting on it - the equivalent of a device removal on Windows.
+        device_wedged_.store(true, std::memory_order_relaxed);
+        ERR("GPU made no progress for ", kGPUHangDetectionTimeoutMs,
+            "ms at frame ", chunk.frame_, "; treating the device as lost");
+      } else {
+        // Completed (probably with an error) without signalling the event.
+        chunk.attached_cmdbuf.waitUntilCompleted();
+      }
     }
     if (chunk.attached_cmdbuf.status() == WMTCommandBufferStatusError) {
       ERR("Device error at frame ", chunk.frame_, ": ", chunk.attached_cmdbuf.error().description().getUTF8String());

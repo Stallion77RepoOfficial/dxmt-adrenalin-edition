@@ -121,12 +121,12 @@ public:
 
   uint64_t
   currentSuballocationOffset() const noexcept {
-    return current_suballocation_ * suballocation_size_;
+    return base_offset_ + current_suballocation_ * suballocation_size_;
   }
 
   uint64_t
   currentSuballocationOffset(uint64_t stride) const noexcept {
-    return current_suballocation_ * stride;
+    return base_offset_ + current_suballocation_ * stride;
   }
 
   uint32_t currentSuballocation() {
@@ -139,7 +139,7 @@ public:
       memcpy(reinterpret_cast<char *>(mappedMemory_) + suballocation * suballocation_size_ + offset, data, length);
       return;
     }
-    obj_.updateContents(suballocation * suballocation_size_ + offset, data, length);
+    obj_.updateContents(base_offset_ + suballocation * suballocation_size_ + offset, data, length);
   }
 
   DXMT_RESOURCE_RESIDENCY_STATE residencyState;
@@ -147,6 +147,7 @@ public:
 
 private:
   BufferAllocation(WMT::Device device, const WMTBufferInfo &info, Flags<BufferAllocationFlag> flags);
+  BufferAllocation(WMT::Buffer buffer, const WMTBufferInfo &info, uint64_t base_offset);
   void free();
 
   BufferAllocation(const BufferAllocation &) = delete;
@@ -164,6 +165,7 @@ private:
   uint32_t suballocation_count_ = 1;
 
   void * placed_buffer = nullptr;
+  uint64_t base_offset_ = 0;
 };
 
 class Buffer {
@@ -179,6 +181,7 @@ public:
   }
 
   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags);
+  Rc<BufferAllocation> importBuffer(WMT::Buffer buffer, const WMTBufferInfo &info, uint64_t offset = 0);
 
   Rc<BufferAllocation> rename(Rc<BufferAllocation> &&newAllocation);
 

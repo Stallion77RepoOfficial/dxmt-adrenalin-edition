@@ -4,6 +4,9 @@
 
 namespace dxmt {
 
+// Largest point size a point list gets, and what MaxPointSize reports.
+constexpr float kMaxPointSize = 256.0f;
+
 // Returns a D3DCAPS9 that accurately reflects what DXMT can deliver
 // on top of a Metal/D3D11 backend.  We advertise SM3 (ps_3_0 / vs_3_0)
 // because that is the highest D3D9 shader model we implement.
@@ -42,7 +45,10 @@ FillD3D9Caps(D3DCAPS9 *caps) {
       D3DPMISCCAPS_CULLNONE           | D3DPMISCCAPS_FOGANDSPECULARALPHA    |
       D3DPMISCCAPS_MASKZ              | D3DPMISCCAPS_MRTINDEPENDENTBITDEPTHS|
       D3DPMISCCAPS_MRTPOSTPIXELSHADERBLENDING | D3DPMISCCAPS_SEPARATEALPHABLEND |
-      D3DPMISCCAPS_INDEPENDENTWRITEMASKS;
+      D3DPMISCCAPS_INDEPENDENTWRITEMASKS |
+      // The fixed-function pipeline has D3DTA_TEMP / D3DTSS_RESULTARG and
+      // D3DTSS_CONSTANT; without these bits a game never asks for them.
+      D3DPMISCCAPS_TSSARGTEMP         | D3DPMISCCAPS_PERSTAGECONSTANT;
 
   caps->RasterCaps =
       D3DPRASTERCAPS_ANISOTROPY       | D3DPRASTERCAPS_COLORPERSPECTIVE     |
@@ -77,9 +83,12 @@ FillD3D9Caps(D3DCAPS9 *caps) {
       D3DPTEXTURECAPS_CUBEMAP         | D3DPTEXTURECAPS_CUBEMAP_POW2 |
       D3DPTEXTURECAPS_MIPCUBEMAP      | D3DPTEXTURECAPS_MIPMAP       |
       D3DPTEXTURECAPS_MIPVOLUMEMAP    | D3DPTEXTURECAPS_NOPROJECTEDBUMPENV |
-      D3DPTEXTURECAPS_PERSPECTIVE     | D3DPTEXTURECAPS_POW2         |
-      // POW2 is set, so the engine requires NONPOW2CONDITIONAL to pass its check.
-      D3DPTEXTURECAPS_NONPOW2CONDITIONAL |
+      D3DPTEXTURECAPS_PERSPECTIVE     |
+      // Neither POW2 nor NONPOW2CONDITIONAL: 2D textures of any size, with
+      // mipmaps and every address mode, as every D3D10-class Windows driver
+      // reports. POW2 alone fails the IW (Call of Duty) engine's caps check,
+      // and POW2 with NONPOW2CONDITIONAL makes games pad or shrink
+      // non-power-of-two textures and skip INTZ paths.
       D3DPTEXTURECAPS_PROJECTED       | D3DPTEXTURECAPS_TEXREPEATNOTSCALEDBYSIZE |
       D3DPTEXTURECAPS_VOLUMEMAP       | D3DPTEXTURECAPS_VOLUMEMAP_POW2;
 
@@ -120,8 +129,10 @@ FillD3D9Caps(D3DCAPS9 *caps) {
       D3DSTENCILCAPS_REPLACE  | D3DSTENCILCAPS_ZERO    |
       D3DSTENCILCAPS_TWOSIDED;
 
+  // The TEXCOORDCOUNT field is the low 16 bits of FVFCaps (the macro is the
+  // field's mask, not a shift): up to 8 texture coordinate sets in an FVF.
   caps->FVFCaps =
-      D3DFVFCAPS_PSIZE | (8 << D3DFVFCAPS_TEXCOORDCOUNTMASK);
+      D3DFVFCAPS_PSIZE | (8 & D3DFVFCAPS_TEXCOORDCOUNTMASK);
 
   caps->TextureOpCaps =
       D3DTEXOPCAPS_ADD                | D3DTEXOPCAPS_ADDSIGNED         |
@@ -151,7 +162,7 @@ FillD3D9Caps(D3DCAPS9 *caps) {
   caps->MaxUserClipPlanes           = 8;
   caps->MaxVertexBlendMatrices      = 4;
   caps->MaxVertexBlendMatrixIndex   = 255;
-  caps->MaxPointSize                = 256.0f;
+  caps->MaxPointSize                = kMaxPointSize;
   caps->MaxPrimitiveCount           = 0x555555;
   caps->MaxVertexIndex              = 0xFFFFFF;
   caps->MaxStreams                  = 16;
@@ -163,10 +174,16 @@ FillD3D9Caps(D3DCAPS9 *caps) {
   caps->PixelShaderVersion           = D3DPS_VERSION(3, 0);
   caps->PixelShader1xMaxValue        = 8.0f;
 
+  /* The N-patch and displacement-map bits are deliberately absent. Claiming
+   * them made this device advertise adaptive tessellation and presampled
+   * displacement mapping while MaxNpatchTessellationLevel was zero, the
+   * D3DRS_ADAPTIVETESS_* and D3DRS_*TESSELLATIONLEVEL states were never read,
+   * D3DSAMP_DMAPOFFSET was unimplemented and ProcessVertices returned
+   * E_NOTIMPL -- so a game that checked the caps and took that path got
+   * nothing back. Advertising less than the hardware has costs a slower path;
+   * advertising more costs a path that cannot run at all. */
   caps->DevCaps2 =
-      D3DDEVCAPS2_ADAPTIVETESSRTPATCH | D3DDEVCAPS2_ADAPTIVETESSNPATCH |
       D3DDEVCAPS2_CAN_STRETCHRECT_FROM_TEXTURES |
-      D3DDEVCAPS2_DMAPNPATCH | D3DDEVCAPS2_PRESAMPLEDDMAPNPATCH |
       D3DDEVCAPS2_STREAMOFFSET | D3DDEVCAPS2_VERTEXELEMENTSCANSHARESTREAMOFFSET;
 
   caps->MaxNpatchTessellationLevel = 0.0f;

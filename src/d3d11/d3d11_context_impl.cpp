@@ -30,6 +30,7 @@
 #include "d3d11_context_state.hpp"
 #include "d3d11_device.hpp"
 #include "d3d11_pipeline.hpp"
+#include "config/config.hpp"
 #include "d3d11_query.hpp"
 #include "dxmt_buffer.hpp"
 #include "dxmt_context.hpp"
@@ -41,8 +42,86 @@
 #include "util_flags.hpp"
 #include "util_math.hpp"
 #include "util_win32_compat.h"
+#include <atomic>
+#include <chrono>
+#include <thread>
+#include <d3d11on12.h>
 
 namespace dxmt {
+
+/* Waiting for a pipeline to compile on the encoding thread stalls the entire
+ * frame. Measured on Splinter Cell's main menu: one such wait per stalling
+ * frame, 1.25 s each, which is the whole of that menu's 2.7 fps. The draw is
+ * skipped until the pipeline is ready instead -- a few frames without one
+ * element, rather than seconds without a frame. The binding is cleared along
+ * with it, because the draw that follows is only skipped when nothing is
+ * bound: leaving the previous pipeline in place would draw this geometry with
+ * the wrong shader, which is worse than not drawing it. Compute keeps waiting: a
+ * dispatch that silently does not run corrupts data, it does not drop pixels.
+ *
+ * d3d11.asyncPipelineCompilation=false restores the blocking behaviour, which
+ * is how this was measured in the first place. */
+static bool
+AsyncPipelineCompilation(MTLD3D11Device *device) {
+  static const bool value =
+      Config::getInstance().getOption<bool>("d3d11.asyncPipelineCompilation", true);
+  if (!value) return false;
+  // The D3D12 bridge promises to execute a valid PSO's first draw. Its DXBC
+  // path cannot inherit D3D11's optional draw-skipping compilation policy.
+  ID3D11On12Device *on12 = nullptr;
+  if (SUCCEEDED(device->QueryInterface(__uuidof(ID3D11On12Device), reinterpret_cast<void **>(&on12)))) {
+    on12->Release();
+    return false;
+  }
+  return true;
+}
+
+/* Skipping is the last resort, though. Most pipelines are ready within a few
+ * milliseconds of being asked for (1-4 ms on an M4; the process's first one,
+ * cold, 25-95), and a draw skipped is a draw lost for good when the
+ * application renders it once -- into a texture it keeps, or a frame it reads
+ * back. So a draw waits for its pipeline while the command buffer's budget
+ * lasts (d3d11.pipelineWaitBudget, milliseconds) and is only skipped once it
+ * is spent: a burst of new pipelines costs a bounded hitch, not lost
+ * geometry, and a slow one still cannot hold a frame for a second. A game
+ * submits about one command buffer a frame; one that flushes to read results
+ * back gets a fresh budget for the work it is about to wait on anyway. Only
+ * the encoding thread gets here, so the budget is its own. */
+static bool
+PipelineReadyWithinBudget(ArgumentEncodingContext &enc, ThreadpoolWork *pso) {
+  /* Until a first pipeline has finished, the Metal compiler service is still
+   * starting up (100-160 ms for that first one); the opening frames get a
+   * budget that covers it rather than drawing without their pipelines. */
+  static std::atomic_bool compiler_warm = false;
+  if (pso->GetIsDone()) {
+    compiler_warm.store(true, std::memory_order_relaxed);
+    return true;
+  }
+  static const auto budget = std::chrono::milliseconds(
+      Config::getInstance().getOption<int32_t>("d3d11.pipelineWaitBudget", 100));
+  static thread_local uint64_t budget_seq = ~0ull;
+  static thread_local std::chrono::steady_clock::duration budget_left{};
+  if (budget_seq != enc.currentSeqId()) {
+    budget_seq = enc.currentSeqId();
+    budget_left = budget;
+  }
+  if (!compiler_warm.load(std::memory_order_relaxed))
+    budget_left = std::max<std::chrono::steady_clock::duration>(budget_left, std::chrono::seconds(1));
+  auto start = std::chrono::steady_clock::now();
+  while (!pso->GetIsDone()) {
+    if (std::chrono::steady_clock::now() - start >= budget_left) {
+      budget_left = {};
+      enc.currentFrameStatistics().async_pipeline_skips++;
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::microseconds(250));
+  }
+  budget_left -= std::chrono::steady_clock::now() - start;
+  compiler_warm.store(true, std::memory_order_relaxed);
+  return true;
+}
+
+
 
 template<typename Object> Rc<Object> forward_rc(Rc<Object>& obj);
 
@@ -305,6 +384,145 @@ public:
   };
 };
 
+/* The typeless format that heads the family a format belongs to -- the
+ * formats a copy may cross between -- or the format itself when it is alone.
+ * Depth formats are members of the colour families they alias. */
+static DXGI_FORMAT
+CopyFamily(DXGI_FORMAT format) {
+  switch (format) {
+  case DXGI_FORMAT_R32G32B32A32_FLOAT:
+  case DXGI_FORMAT_R32G32B32A32_UINT:
+  case DXGI_FORMAT_R32G32B32A32_SINT:
+    return DXGI_FORMAT_R32G32B32A32_TYPELESS;
+  case DXGI_FORMAT_R32G32B32_FLOAT:
+  case DXGI_FORMAT_R32G32B32_UINT:
+  case DXGI_FORMAT_R32G32B32_SINT:
+    return DXGI_FORMAT_R32G32B32_TYPELESS;
+  case DXGI_FORMAT_R16G16B16A16_FLOAT:
+  case DXGI_FORMAT_R16G16B16A16_UNORM:
+  case DXGI_FORMAT_R16G16B16A16_UINT:
+  case DXGI_FORMAT_R16G16B16A16_SNORM:
+  case DXGI_FORMAT_R16G16B16A16_SINT:
+    return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+  case DXGI_FORMAT_R32G32_FLOAT:
+  case DXGI_FORMAT_R32G32_UINT:
+  case DXGI_FORMAT_R32G32_SINT:
+    return DXGI_FORMAT_R32G32_TYPELESS;
+  case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+  case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+  case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+    return DXGI_FORMAT_R32G8X24_TYPELESS;
+  case DXGI_FORMAT_R10G10B10A2_UNORM:
+  case DXGI_FORMAT_R10G10B10A2_UINT:
+    return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+  case DXGI_FORMAT_R8G8B8A8_UNORM:
+  case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+  case DXGI_FORMAT_R8G8B8A8_UINT:
+  case DXGI_FORMAT_R8G8B8A8_SNORM:
+  case DXGI_FORMAT_R8G8B8A8_SINT:
+    return DXGI_FORMAT_R8G8B8A8_TYPELESS;
+  case DXGI_FORMAT_R16G16_FLOAT:
+  case DXGI_FORMAT_R16G16_UNORM:
+  case DXGI_FORMAT_R16G16_UINT:
+  case DXGI_FORMAT_R16G16_SNORM:
+  case DXGI_FORMAT_R16G16_SINT:
+    return DXGI_FORMAT_R16G16_TYPELESS;
+  case DXGI_FORMAT_D32_FLOAT:
+  case DXGI_FORMAT_R32_FLOAT:
+  case DXGI_FORMAT_R32_UINT:
+  case DXGI_FORMAT_R32_SINT:
+    return DXGI_FORMAT_R32_TYPELESS;
+  case DXGI_FORMAT_D24_UNORM_S8_UINT:
+  case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+  case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+    return DXGI_FORMAT_R24G8_TYPELESS;
+  case DXGI_FORMAT_R8G8_UNORM:
+  case DXGI_FORMAT_R8G8_UINT:
+  case DXGI_FORMAT_R8G8_SNORM:
+  case DXGI_FORMAT_R8G8_SINT:
+    return DXGI_FORMAT_R8G8_TYPELESS;
+  case DXGI_FORMAT_R16_FLOAT:
+  case DXGI_FORMAT_D16_UNORM:
+  case DXGI_FORMAT_R16_UNORM:
+  case DXGI_FORMAT_R16_UINT:
+  case DXGI_FORMAT_R16_SNORM:
+  case DXGI_FORMAT_R16_SINT:
+    return DXGI_FORMAT_R16_TYPELESS;
+  case DXGI_FORMAT_R8_UNORM:
+  case DXGI_FORMAT_R8_UINT:
+  case DXGI_FORMAT_R8_SNORM:
+  case DXGI_FORMAT_R8_SINT:
+    return DXGI_FORMAT_R8_TYPELESS;
+  case DXGI_FORMAT_BC1_UNORM:
+  case DXGI_FORMAT_BC1_UNORM_SRGB:
+    return DXGI_FORMAT_BC1_TYPELESS;
+  case DXGI_FORMAT_BC2_UNORM:
+  case DXGI_FORMAT_BC2_UNORM_SRGB:
+    return DXGI_FORMAT_BC2_TYPELESS;
+  case DXGI_FORMAT_BC3_UNORM:
+  case DXGI_FORMAT_BC3_UNORM_SRGB:
+    return DXGI_FORMAT_BC3_TYPELESS;
+  case DXGI_FORMAT_BC4_UNORM:
+  case DXGI_FORMAT_BC4_SNORM:
+    return DXGI_FORMAT_BC4_TYPELESS;
+  case DXGI_FORMAT_BC5_UNORM:
+  case DXGI_FORMAT_BC5_SNORM:
+    return DXGI_FORMAT_BC5_TYPELESS;
+  case DXGI_FORMAT_B8G8R8A8_UNORM:
+  case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+  case DXGI_FORMAT_B8G8R8X8_UNORM:
+  case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+    return DXGI_FORMAT_B8G8R8X8_TYPELESS;
+  case DXGI_FORMAT_BC6H_UF16:
+  case DXGI_FORMAT_BC6H_SF16:
+    return DXGI_FORMAT_BC6H_TYPELESS;
+  case DXGI_FORMAT_BC7_UNORM:
+  case DXGI_FORMAT_BC7_UNORM_SRGB:
+    return DXGI_FORMAT_BC7_TYPELESS;
+  default:
+    return format;
+  }
+}
+
+/* Whether a copy between two formats of the same compression copies at all:
+ * within a family, and between the shared-exponent format and the 32-bit
+ * single-channel family it is laid out as. */
+static bool
+IsCopyCompatible(DXGI_FORMAT a, DXGI_FORMAT b) {
+  DXGI_FORMAT fa = CopyFamily(a), fb = CopyFamily(b);
+  if (fa == fb)
+    return true;
+  return (fa == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && fb == DXGI_FORMAT_R32_TYPELESS) ||
+         (fb == DXGI_FORMAT_R9G9B9E5_SHAREDEXP && fa == DXGI_FORMAT_R32_TYPELESS);
+}
+
+/* The texel size of an uncompressed format that a block-compressed copy can
+ * pair with, or 0 for one it cannot. */
+static uint32_t
+BlockCopyTexelSize(DXGI_FORMAT format) {
+  switch (format) {
+  case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+  case DXGI_FORMAT_R32G32B32A32_FLOAT:
+  case DXGI_FORMAT_R32G32B32A32_UINT:
+  case DXGI_FORMAT_R32G32B32A32_SINT:
+    return 16;
+  case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+  case DXGI_FORMAT_R16G16B16A16_FLOAT:
+  case DXGI_FORMAT_R16G16B16A16_UNORM:
+  case DXGI_FORMAT_R16G16B16A16_UINT:
+  case DXGI_FORMAT_R16G16B16A16_SNORM:
+  case DXGI_FORMAT_R16G16B16A16_SINT:
+  case DXGI_FORMAT_R32G32_TYPELESS:
+  case DXGI_FORMAT_R32G32_FLOAT:
+  case DXGI_FORMAT_R32G32_UINT:
+  case DXGI_FORMAT_R32G32_SINT:
+    return 8;
+  default:
+    return 0;
+  }
+}
+
 class TextureCopyCommand {
 public:
   ID3D11Resource *pSrc;
@@ -481,6 +699,10 @@ public:
       DstFormat(Dst_.FormatDescription) {
 
     if (DstFormat.PixelFormat == WMTPixelFormatInvalid || DstFormat.BytesPerTexel == 0)
+      return;
+    /* Not a destination D3D11 updates: a depth-stencil resource. Its bytes
+     * per texel describe a staging copy's layout, not this upload's. */
+    if (DstFormat.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER))
       return;
 
     switch (Dst_.Dimension) {
@@ -661,6 +883,8 @@ public:
   void
   STDMETHODCALLTYPE
   ClearRenderTargetView(ID3D11RenderTargetView *pRenderTargetView, const FLOAT ColorRGBA[4]) override {
+    if (!pRenderTargetView)
+      return;
     std::lock_guard<mutex_t> lock(mutex);
 
     ClearRenderTargetView(static_cast<D3D11RenderTargetView *>(pRenderTargetView), ColorRGBA);
@@ -669,6 +893,8 @@ public:
   void
   STDMETHODCALLTYPE
   ClearUnorderedAccessViewUint(ID3D11UnorderedAccessView *pUnorderedAccessView, const UINT Values[4]) override {
+    if (!pUnorderedAccessView)
+      return;
     std::lock_guard<mutex_t> lock(mutex);
 
     ClearUnorderedAccessViewUint(static_cast<D3D11UnorderedAccessView *>(pUnorderedAccessView), Values);
@@ -739,6 +965,8 @@ public:
   void
   STDMETHODCALLTYPE
   ClearUnorderedAccessViewFloat(ID3D11UnorderedAccessView *pUnorderedAccessView, const FLOAT Values[4]) override {
+    if (!pUnorderedAccessView)
+      return;
     std::lock_guard<mutex_t> lock(mutex);
 
     ClearUnorderedAccessViewFloat(static_cast<D3D11UnorderedAccessView *>(pUnorderedAccessView), Values);
@@ -796,6 +1024,8 @@ public:
   STDMETHODCALLTYPE
   ClearDepthStencilView(ID3D11DepthStencilView *pDepthStencilView, UINT ClearFlags, FLOAT Depth, UINT8 Stencil)
       override {
+    if (!pDepthStencilView)
+      return;
     std::lock_guard<mutex_t> lock(mutex);
 
     ClearDepthStencilView(static_cast<D3D11DepthStencilView*>(pDepthStencilView), ClearFlags, Depth, Stencil);
@@ -946,6 +1176,15 @@ public:
       if (desc.ViewDimension == D3D11_SRV_DIMENSION_BUFFER || desc.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX) {
         return;
       }
+      /* Mips are generated only for a resource made with GENERATE_MIPS, and
+       * only through a view whose format can be filtered. */
+      Com<ID3D11Resource> resource;
+      pShaderResourceView->GetResource(&resource);
+      if (!(GetResourceCommon(resource.ptr())->miscFlags() & D3D11_RESOURCE_MISC_GENERATE_MIPS))
+        return;
+      UINT support = 0;
+      if (FAILED(device->CheckFormatSupport(desc.Format, &support)) || !(support & D3D11_FORMAT_SUPPORT_MIP_AUTOGEN))
+        return;
       SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
       EmitOP([tex = srv->texture(), viewId = srv->viewId()](ArgumentEncodingContext &enc) {
         // workaround: mipmap generation of a8unorm is borked, so use a r8unorm view
@@ -999,12 +1238,18 @@ public:
       ERR("ResolveSubresource: invalid format ", Format);
       return;
     }
+    /* A depth buffer -- D3D9's StretchRect resolves one -- is viewed in its
+     * own format: the typeless DXGI format it comes with names a colour one. */
+    auto src_texture = static_cast<D3D11ResourceCommon *>(pSrcResource)->texture();
+    WMTPixelFormat view_format = format_desc.PixelFormat;
+    if (DepthStencilPlanarFlags(src_texture->pixelFormat()))
+      view_format = src_texture->pixelFormat();
     InvalidateCurrentPass();
-    EmitOP([src = static_cast<D3D11ResourceCommon *>(pSrcResource)->texture(),
+    EmitOP([src = std::move(src_texture),
             dst = static_cast<D3D11ResourceCommon *>(pDstResource)->texture(),
             dst_level = DstSubresource % Dst.Texture2DDesc.MipLevels,
             dst_slice = DstSubresource / Dst.Texture2DDesc.MipLevels, SrcSubresource,
-            format = format_desc.PixelFormat](ArgumentEncodingContext &enc) mutable {
+            format = view_format](ArgumentEncodingContext &enc) mutable {
       TextureViewDescriptor src_desc;
       src_desc.format = format;
       src_desc.type = src->textureType();
@@ -1160,6 +1405,14 @@ public:
     }
   }
 
+  /* UpdateSubresource renames a buffer it rewrites through the buffer's
+   * dynamic allocation, default buffers included -- a map an application may
+   * not make, so the context's own check is not applied to it. */
+  virtual HRESULT
+  MapForUpdate(ID3D11Resource *pResource, D3D11_MAP MapType, D3D11_MAPPED_SUBRESOURCE *pMappedResource) {
+    return Map(pResource, 0, MapType, 0, pMappedResource);
+  }
+
   void
   STDMETHODCALLTYPE
   UpdateSubresource(
@@ -1199,14 +1452,14 @@ public:
       if (auto dynamic = GetDynamicBuffer(pDstResource, &buffer_len, &unused_bind_flag)) {
         D3D11_MAPPED_SUBRESOURCE mapped;
         if ((CopyFlags & D3D11_COPY_DISCARD) || (copy_len == buffer_len && copy_offset == 0)) {
-          Map(pDstResource, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+          MapForUpdate(pDstResource, D3D11_MAP_WRITE_DISCARD, &mapped);
           auto [allocation, sub] = GetDynamicBufferAllocation(dynamic);
           allocation->updateContents(copy_offset, pSrcData, copy_len, sub);
           Unmap(pDstResource, 0);
           return;
         }
         if (CopyFlags & D3D11_COPY_NO_OVERWRITE) {
-          Map(pDstResource, 0, D3D11_MAP_WRITE_NO_OVERWRITE, 0, &mapped);
+          MapForUpdate(pDstResource, D3D11_MAP_WRITE_NO_OVERWRITE, &mapped);
           auto [allocation, sub] = GetDynamicBufferAllocation(dynamic);
           allocation->updateContents(copy_offset, pSrcData, copy_len, sub);
           Unmap(pDstResource, 0);
@@ -1214,11 +1467,9 @@ public:
         }
       }
       if (auto staging = GetStagingResource(pDstResource, DstSubresource); unlikely(staging)) {
-        // Per MSDN: The CPU copies data from memory to a subresource created in non-mappable memory.
-        // Also MSDN: A resource cannot be used as a destination if: the resource is created with immutable or
-        // dynamic usage.
-        // So it's legal?
-        UNIMPLEMENTED("update buffer: staging");
+        /* Windows leaves a staging buffer as it is: the update is dropped
+         * (Wine's test_staging_buffers reads the old contents back). */
+        return;
       } else if (auto bindable = GetResourceCommon(pDstResource)) {
         auto [staging_buffer, offset] = AllocateStagingBuffer(copy_len, 16);
         staging_buffer.updateContents(offset, pSrcData, copy_len);
@@ -1292,6 +1543,13 @@ public:
     EmitOP([Primitive, StartVertexLocation, VertexCount](ArgumentEncodingContext& enc) {
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
+      /* No pipeline was ever bound on this encoder, because building it
+       * failed -- a shader DXMT could not convert, most often. Drawing anyway
+       * faults inside Metal, which surfaces as a failed unix call and takes
+       * the process down; skipping the draw leaves a visibly wrong frame
+       * instead, which is what a missing shader should cost. */
+      if (!enc.currentRenderEncoder()->last_pso)
+        return;
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw>();
       cmd.type = WMTRenderCommandDraw;
       cmd.primitive_type = Primitive;
@@ -1371,6 +1629,13 @@ public:
           StartInstanceLocation](ArgumentEncodingContext &enc) {
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
+      /* No pipeline was ever bound on this encoder, because building it
+       * failed -- a shader DXMT could not convert, most often. Drawing anyway
+       * faults inside Metal, which surfaces as a failed unix call and takes
+       * the process down; skipping the draw leaves a visibly wrong frame
+       * instead, which is what a missing shader should cost. */
+      if (!enc.currentRenderEncoder()->last_pso)
+        return;
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_draw>();
       cmd.type = WMTRenderCommandDraw;
       cmd.primitive_type = Primitive;
@@ -1461,6 +1726,13 @@ public:
 
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
+      /* No pipeline was ever bound on this encoder, because building it
+       * failed -- a shader DXMT could not convert, most often. Drawing anyway
+       * faults inside Metal, which surfaces as a failed unix call and takes
+       * the process down; skipping the draw leaves a visibly wrong frame
+       * instead, which is what a missing shader should cost. */
+      if (!enc.currentRenderEncoder()->last_pso)
+        return;
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw>();
       cmd.type = WMTRenderCommandDXMTTessellationMeshDraw;
       cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
@@ -1503,6 +1775,13 @@ public:
       auto [index_buffer, index_sub_offset] = enc.currentIndexBuffer();
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
+      /* No pipeline was ever bound on this encoder, because building it
+       * failed -- a shader DXMT could not convert, most often. Drawing anyway
+       * faults inside Metal, which surfaces as a failed unix call and takes
+       * the process down; skipping the draw leaves a visibly wrong frame
+       * instead, which is what a missing shader should cost. */
+      if (!enc.currentRenderEncoder()->last_pso)
+        return;
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_tessellation_mesh_draw_indexed>();
       cmd.type = WMTRenderCommandDXMTTessellationMeshDrawIndexed;
       cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
@@ -1539,6 +1818,13 @@ public:
 
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
+      /* No pipeline was ever bound on this encoder, because building it
+       * failed -- a shader DXMT could not convert, most often. Drawing anyway
+       * faults inside Metal, which surfaces as a failed unix call and takes
+       * the process down; skipping the draw leaves a visibly wrong frame
+       * instead, which is what a missing shader should cost. */
+      if (!enc.currentRenderEncoder()->last_pso)
+        return;
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw>();
       cmd.type = WMTRenderCommandDXMTGeometryDraw;
       cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
@@ -1575,6 +1861,13 @@ public:
 
       enc.bumpVisibilityResultOffset();
       enc.resolveRenderPassBarrier();
+      /* No pipeline was ever bound on this encoder, because building it
+       * failed -- a shader DXMT could not convert, most often. Drawing anyway
+       * faults inside Metal, which surfaces as a failed unix call and takes
+       * the process down; skipping the draw leaves a visibly wrong frame
+       * instead, which is what a missing shader should cost. */
+      if (!enc.currentRenderEncoder()->last_pso)
+        return;
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_dxmt_geometry_draw_indexed>();
       cmd.type = WMTRenderCommandDXMTGeometryDrawIndexed;
       cmd.draw_arguments_offset = enc.getFinalArgumentBufferOffset(draw_arguments_offset);
@@ -1886,7 +2179,33 @@ public:
   void
   STDMETHODCALLTYPE
   SwapDeviceContextState(ID3DDeviceContextState *pState, ID3DDeviceContextState **ppPreviousState) override {
-    UNIMPLEMENTED("SwapDeviceContextState");
+    InitReturnPtr(ppPreviousState);
+    /* A deferred context has no state of its own to swap. */
+    if (!pState || GetType() == D3D11_DEVICE_CONTEXT_DEFERRED)
+      return;
+    std::lock_guard<mutex_t> lock(mutex);
+
+    /* The live state moves into the object that was current -- a new one the
+     * first time -- and the incoming object's state becomes live, rebound
+     * from scratch. Direct2D brackets its drawing with this to keep the
+     * application's state intact. The current object is held privately: an
+     * application may release it while it is in use. */
+    Com<MTLD3D11DeviceContextState, false> previous = std::move(state_object_);
+    if (!previous)
+      previous = new MTLD3D11DeviceContextState(device);
+    auto next = static_cast<MTLD3D11DeviceContextState *>(pState);
+    previous->state = std::move(state_);
+    ResetEncodingContextState();
+    state_ = std::move(next->state);
+    next->state = {};
+    dirty_state.set(DirtyState::DepthStencilState, DirtyState::RasterizerState, DirtyState::BlendFactorAndStencilRef,
+                    DirtyState::Viewport, DirtyState::Scissors);
+    RestoreEncodingContextState();
+    if (state_.predicate)
+      EmitST([](ArgumentEncodingContext &enc) { enc.setCompatibilityFlag(FeatureCompatibility::UnsupportedPredication); });
+    state_object_ = next;
+    if (ppPreviousState)
+      *ppPreviousState = ref(previous.ptr());
   }
 
   void
@@ -3183,7 +3502,10 @@ public:
       const D3D11_TILE_REGION_SIZE *region_sizes, ID3D11Buffer *pool, UINT range_count, const UINT *range_flags,
       const UINT *pool_start_offsets, const UINT *range_tile_counts, UINT flags
   ) override {
-    UNIMPLEMENTED("tiled resource: update mapping");
+    /* No resource is tiled (the tier reported is NOT_SUPPORTED), so there is
+     * nothing a tile call can name; D3D11 refuses it, or ignores it where it
+     * returns nothing. */
+    return E_INVALIDARG;
   };
 
   HRESULT STDMETHODCALLTYPE CopyTileMappings(
@@ -3191,30 +3513,30 @@ public:
       ID3D11Resource *src_resource, const D3D11_TILED_RESOURCE_COORDINATE *src_start_coordinate,
       const D3D11_TILE_REGION_SIZE *region_size, UINT flags
   ) override {
-    UNIMPLEMENTED("tiled resource: copy mapping");
+    return E_INVALIDARG;
   };
 
   void STDMETHODCALLTYPE CopyTiles(
       ID3D11Resource *resource, const D3D11_TILED_RESOURCE_COORDINATE *start_coordinate,
       const D3D11_TILE_REGION_SIZE *size, ID3D11Buffer *buffer, UINT64 start_offset, UINT flags
   ) override {
-    UNIMPLEMENTED("tiled resource: copy tiles");
+    ERR_ONCE("CopyTiles: no tiled resources");
   };
 
   void STDMETHODCALLTYPE UpdateTiles(
       ID3D11Resource *dst_resource, const D3D11_TILED_RESOURCE_COORDINATE *dst_start_coordinate,
       const D3D11_TILE_REGION_SIZE *dst_region_size, const void *src_data, UINT flags
   ) override {
-    UNIMPLEMENTED("tiled resource: update tiles");
+    ERR_ONCE("UpdateTiles: no tiled resources");
   };
 
   HRESULT STDMETHODCALLTYPE ResizeTilePool(ID3D11Buffer *pool, UINT64 size) override {
-    UNIMPLEMENTED("tiled resource: resize");
+    return E_INVALIDARG;
   };
 
   void STDMETHODCALLTYPE
   TiledResourceBarrier(ID3D11DeviceChild *before_barrier, ID3D11DeviceChild *after_barrier) override {
-    UNIMPLEMENTED("tiled resource: barrier");
+    ERR_ONCE("TiledResourceBarrier: no tiled resources");
   };
 
   WINBOOL STDMETHODCALLTYPE
@@ -3714,6 +4036,10 @@ public:
   ) {
     std::lock_guard<mutex_t> lock(mutex);
 
+    if (StartSlot >= D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT ||
+        NumBuffers > D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT - StartSlot)
+      return;
+
     auto &VertexBuffers = state_.InputAssembler.VertexBuffers;
     for (unsigned slot = StartSlot; slot < StartSlot + NumBuffers; slot++) {
       auto pVertexBuffer = GetResourceCommon(ppVertexBuffers[slot - StartSlot]);
@@ -3745,7 +4071,7 @@ public:
           entry.Offset = pOffsets[slot - StartSlot];
         } else {
           ERR("SetVertexBuffers: offset is null");
-          entry.Stride = 0;
+          entry.Offset = 0;
         }
         entry.Buffer = pVertexBuffer;
           EmitST([=, buffer = entry.Buffer->buffer(), offset = entry.Offset,
@@ -3768,7 +4094,7 @@ public:
 
     auto &VertexBuffers = state_.InputAssembler.VertexBuffers;
     for (unsigned i = 0; i < NumBuffers; i++) {
-      if (!VertexBuffers.test_bound(i + StartSlot)) {
+      if (i + StartSlot >= D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT || !VertexBuffers.test_bound(i + StartSlot)) {
         if (ppVertexBuffers != NULL)
           ppVertexBuffers[i] = nullptr;
         if (pStrides != NULL)
@@ -3891,12 +4217,24 @@ public:
     if (cmd.Invalid)
       return;
     if ((cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC) != (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_BC)) {
+      /* Direct3D 10.1 copies a compressed block to or from an uncompressed
+       * texel of the same size, and only these: BC1/BC4 with the 64-bit RGBA16
+       * and RG32 families, the 128-bit BC formats with RGBA32. Any other
+       * pairing, or an older feature level, leaves the destination as it
+       * was. */
+      bool src_compressed = cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC;
+      uint32_t block_size = src_compressed ? cmd.SrcFormat.BytesPerTexel : cmd.DstFormat.BytesPerTexel;
+      DXGI_FORMAT uncompressed = src_compressed ? cmd.Dst.Format : cmd.Src.Format;
+      if (device->GetFeatureLevel() < D3D_FEATURE_LEVEL_10_1 || block_size != BlockCopyTexelSize(uncompressed))
+        return;
       if (cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC) {
         return CopyTextureFromCompressed(std::move(cmd));
       } else {
         return CopyTextureToCompressed(std::move(cmd));
       }
     }
+    if (!IsCopyCompatible(cmd.Src.Format, cmd.Dst.Format))
+      return;
     return CopyTextureBitcast(std::move(cmd));
   }
 
@@ -4082,12 +4420,81 @@ public:
 
   void
   CopyTextureFromCompressed(TextureCopyCommand &&cmd) {
+    /* A block of the source is a texel of the destination, so a staging side
+     * keeps its own row pitch and only the compressed side's coordinates are
+     * divided into blocks. */
     if (auto staging_dst = GetStagingResource(cmd.pDst, cmd.DstSubresource)) {
-      UNIMPLEMENTED("copy texture: from compressed to staging");
+      if (auto staging_src = GetStagingResource(cmd.pSrc, cmd.SrcSubresource)) {
+        SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
+        UseCopyDestination(staging_dst);
+        UseCopySource(staging_src);
+        EmitOP([dst_ = std::move(staging_dst), src_ = std::move(staging_src),
+                cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
+          auto [src, src_sub_offset] = enc.access(src_->buffer(), 0, src_->length, ResourceAccess::Read);
+          auto [dst, dst_sub_offset] = enc.access(dst_->buffer(), 0, dst_->length, ResourceAccess::Write);
+          uint32_t block_w = align(cmd.SrcSize.width, 4u) >> 2, block_h = align(cmd.SrcSize.height, 4u) >> 2;
+          for (unsigned z = 0; z < cmd.SrcSize.depth; z++) {
+            for (unsigned y = 0; y < block_h; y++) {
+              auto &cmdcp = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+              cmdcp.type = WMTBlitCommandCopyFromBufferToBuffer;
+              cmdcp.copy_length = block_w * cmd.SrcFormat.BytesPerTexel;
+              cmdcp.src = src->buffer();
+              cmdcp.src_offset = src_sub_offset + (cmd.SrcOrigin.z + z) * src_->bytesPerImage +
+                                 ((cmd.SrcOrigin.y >> 2) + y) * src_->bytesPerRow +
+                                 (cmd.SrcOrigin.x >> 2) * cmd.SrcFormat.BytesPerTexel;
+              cmdcp.dst = dst->buffer();
+              cmdcp.dst_offset = dst_sub_offset + (cmd.DstOrigin.z + z) * dst_->bytesPerImage +
+                                 (cmd.DstOrigin.y + y) * dst_->bytesPerRow + cmd.DstOrigin.x * cmd.DstFormat.BytesPerTexel;
+            }
+          }
+        });
+        promote_flush = true;
+      } else if (auto src = GetTexture(cmd.pSrc)) {
+        SwitchToBlitEncoder(CommandBufferState::ReadbackBlitEncoderActive);
+        UseCopyDestination(staging_dst);
+        EmitOP([src_ = std::move(src), dst_ = std::move(staging_dst),
+                cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
+          auto src = enc.access(src_, cmd.Src.MipLevel, cmd.Src.ArraySlice, ResourceAccess::Read);
+          auto [dst, dst_offset] = enc.access(dst_->buffer(), 0, dst_->length, ResourceAccess::Write);
+          auto &cmd_cpbuf = enc.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
+          cmd_cpbuf.type = WMTBlitCommandCopyFromTextureToBuffer;
+          cmd_cpbuf.src = src;
+          cmd_cpbuf.slice = cmd.Src.ArraySlice;
+          cmd_cpbuf.level = cmd.Src.MipLevel;
+          cmd_cpbuf.origin = cmd.SrcOrigin;
+          cmd_cpbuf.size = cmd.SrcSize;
+          cmd_cpbuf.dst = dst->buffer();
+          cmd_cpbuf.offset = dst_offset + cmd.DstOrigin.z * dst_->bytesPerImage + cmd.DstOrigin.y * dst_->bytesPerRow +
+                             cmd.DstOrigin.x * cmd.DstFormat.BytesPerTexel;
+          cmd_cpbuf.bytes_per_row = dst_->bytesPerRow;
+          cmd_cpbuf.bytes_per_image = dst_->bytesPerImage;
+        });
+        promote_flush = true;
+      } else {
+        UNREACHABLE
+      }
     } else if (auto dst = GetTexture(cmd.pDst)) {
       if (auto staging_src = GetStagingResource(cmd.pSrc, cmd.SrcSubresource)) {
-        // copy from staging to default
-        UNIMPLEMENTED("copy texture: from compressed staging to default");
+        SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+        UseCopySource(staging_src);
+        EmitOP([dst_ = std::move(dst), src_ = std::move(staging_src),
+                cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
+          auto [src, src_offset] = enc.access(src_->buffer(), 0, src_->length, ResourceAccess::Read);
+          auto dst = enc.access(dst_, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
+          auto &cmd_cptex = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+          cmd_cptex.type = WMTBlitCommandCopyFromBufferToTexture;
+          cmd_cptex.src = src->buffer();
+          cmd_cptex.src_offset = src_offset + cmd.SrcOrigin.z * src_->bytesPerImage +
+                                 (cmd.SrcOrigin.y >> 2) * src_->bytesPerRow +
+                                 (cmd.SrcOrigin.x >> 2) * cmd.SrcFormat.BytesPerTexel;
+          cmd_cptex.bytes_per_row = src_->bytesPerRow;
+          cmd_cptex.bytes_per_image = src_->bytesPerImage;
+          cmd_cptex.size = {align(cmd.SrcSize.width, 4u) >> 2, align(cmd.SrcSize.height, 4u) >> 2, cmd.SrcSize.depth};
+          cmd_cptex.dst = dst;
+          cmd_cptex.slice = cmd.Dst.ArraySlice;
+          cmd_cptex.level = cmd.Dst.MipLevel;
+          cmd_cptex.origin = cmd.DstOrigin;
+        });
       } else if (auto src = GetTexture(cmd.pSrc)) {
         // on-device copy
         SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
@@ -4133,12 +4540,84 @@ public:
 
   void
   CopyTextureToCompressed(TextureCopyCommand &&cmd) {
+    /* A texel of the source is a block of the destination; see
+     * CopyTextureFromCompressed. */
     if (auto staging_dst = GetStagingResource(cmd.pDst, cmd.DstSubresource)) {
-      UNIMPLEMENTED("copy texture: copy to compressed staging");
+      if (auto staging_src = GetStagingResource(cmd.pSrc, cmd.SrcSubresource)) {
+        SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
+        UseCopyDestination(staging_dst);
+        UseCopySource(staging_src);
+        EmitOP([dst_ = std::move(staging_dst), src_ = std::move(staging_src),
+                cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
+          auto [src, src_sub_offset] = enc.access(src_->buffer(), 0, src_->length, ResourceAccess::Read);
+          auto [dst, dst_sub_offset] = enc.access(dst_->buffer(), 0, dst_->length, ResourceAccess::Write);
+          for (unsigned z = 0; z < cmd.SrcSize.depth; z++) {
+            for (unsigned y = 0; y < cmd.SrcSize.height; y++) {
+              auto &cmdcp = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
+              cmdcp.type = WMTBlitCommandCopyFromBufferToBuffer;
+              cmdcp.copy_length = cmd.SrcSize.width * cmd.SrcFormat.BytesPerTexel;
+              cmdcp.src = src->buffer();
+              cmdcp.src_offset = src_sub_offset + (cmd.SrcOrigin.z + z) * src_->bytesPerImage +
+                                 (cmd.SrcOrigin.y + y) * src_->bytesPerRow + cmd.SrcOrigin.x * cmd.SrcFormat.BytesPerTexel;
+              cmdcp.dst = dst->buffer();
+              cmdcp.dst_offset = dst_sub_offset + (cmd.DstOrigin.z + z) * dst_->bytesPerImage +
+                                 ((cmd.DstOrigin.y >> 2) + y) * dst_->bytesPerRow +
+                                 (cmd.DstOrigin.x >> 2) * cmd.DstFormat.BytesPerTexel;
+            }
+          }
+        });
+        promote_flush = true;
+      } else if (auto src = GetTexture(cmd.pSrc)) {
+        SwitchToBlitEncoder(CommandBufferState::ReadbackBlitEncoderActive);
+        UseCopyDestination(staging_dst);
+        EmitOP([src_ = std::move(src), dst_ = std::move(staging_dst),
+                cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
+          auto src = enc.access(src_, cmd.Src.MipLevel, cmd.Src.ArraySlice, ResourceAccess::Read);
+          auto [dst, dst_offset] = enc.access(dst_->buffer(), 0, dst_->length, ResourceAccess::Write);
+          auto &cmd_cpbuf = enc.encodeBlitCommand<wmtcmd_blit_copy_from_texture_to_buffer>();
+          cmd_cpbuf.type = WMTBlitCommandCopyFromTextureToBuffer;
+          cmd_cpbuf.src = src;
+          cmd_cpbuf.slice = cmd.Src.ArraySlice;
+          cmd_cpbuf.level = cmd.Src.MipLevel;
+          cmd_cpbuf.origin = cmd.SrcOrigin;
+          cmd_cpbuf.size = cmd.SrcSize;
+          cmd_cpbuf.dst = dst->buffer();
+          cmd_cpbuf.offset = dst_offset + cmd.DstOrigin.z * dst_->bytesPerImage +
+                             (cmd.DstOrigin.y >> 2) * dst_->bytesPerRow +
+                             (cmd.DstOrigin.x >> 2) * cmd.DstFormat.BytesPerTexel;
+          cmd_cpbuf.bytes_per_row = dst_->bytesPerRow;
+          cmd_cpbuf.bytes_per_image = dst_->bytesPerImage;
+        });
+        promote_flush = true;
+      } else {
+        UNREACHABLE
+      }
     } else if (auto dst = GetTexture(cmd.pDst)) {
       if (auto staging_src = GetStagingResource(cmd.pSrc, cmd.SrcSubresource)) {
-        // copy from staging to default
-        UNIMPLEMENTED("copy texture: from staging to compressed default");
+        SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
+        UseCopySource(staging_src);
+        EmitOP([dst_ = std::move(dst), src_ = std::move(staging_src),
+                cmd = std::move(cmd)](ArgumentEncodingContext &enc) {
+          auto [src, src_offset] = enc.access(src_->buffer(), 0, src_->length, ResourceAccess::Read);
+          auto dst = enc.access(dst_, cmd.Dst.MipLevel, cmd.Dst.ArraySlice, ResourceAccess::Write);
+          auto &cmd_cptex = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
+          cmd_cptex.type = WMTBlitCommandCopyFromBufferToTexture;
+          cmd_cptex.src = src->buffer();
+          cmd_cptex.src_offset = src_offset + cmd.SrcOrigin.z * src_->bytesPerImage + cmd.SrcOrigin.y * src_->bytesPerRow +
+                                 cmd.SrcOrigin.x * cmd.SrcFormat.BytesPerTexel;
+          cmd_cptex.bytes_per_row = src_->bytesPerRow;
+          cmd_cptex.bytes_per_image = src_->bytesPerImage;
+          /* The block-aligned size, clipped to the mip's virtual size as the
+           * on-device copy below clips it. */
+          cmd_cptex.size = {
+              std::min(cmd.SrcSize.width << 2, std::max<uint32_t>(dst.width() >> cmd.Dst.MipLevel, 1u) - cmd.DstOrigin.x),
+              std::min(cmd.SrcSize.height << 2, std::max<uint32_t>(dst.height() >> cmd.Dst.MipLevel, 1u) - cmd.DstOrigin.y),
+              cmd.SrcSize.depth};
+          cmd_cptex.dst = dst;
+          cmd_cptex.slice = cmd.Dst.ArraySlice;
+          cmd_cptex.level = cmd.Dst.MipLevel;
+          cmd_cptex.origin = cmd.DstOrigin;
+        });
       } else if (auto src = GetTexture(cmd.pSrc)) {
         // on-device copy
         SwitchToBlitEncoder(CommandBufferState::BlitEncoderActive);
@@ -4230,8 +4709,9 @@ public:
         cmd_cptex.origin = cmd.DstOrigin;
       });
     } else if (auto staging_dst = GetStagingResource(cmd.pDst, cmd.DstSubresource)) {
-      // staging: ...
-      UNIMPLEMENTED("update texture: staging");
+      /* Dropped, as Windows drops an update of a staging buffer (Wine's
+       * test_staging_buffers): a staging resource is written through Map. */
+      return;
     } else {
       UNREACHABLE
     }
@@ -4709,15 +5189,21 @@ public:
       return DrawCallStatus::Invalid;
     }
 
-    EmitST([pso = std::move(pipeline)](ArgumentEncodingContext &enc) {
+    EmitST([pso = std::move(pipeline), allow_async = AsyncPipelineCompilation(m_parent)](ArgumentEncodingContext &enc) {
       auto render_encoder = enc.currentRenderEncoder();
       render_encoder->use_tessellation = 1;
       MTL_COMPILED_TESSELLATION_MESH_PIPELINE GraphicsPipeline{};
-      pso->GetPipeline(&GraphicsPipeline); // may block
+      if (allow_async && !PipelineReadyWithinBudget(enc, pso)) {
+        render_encoder->last_pso = {};
+        return;
+      }
+      pso->GetPipeline(&GraphicsPipeline);
       enc.tess_num_output_control_point_element = GraphicsPipeline.NumControlPointOutputElement;
       enc.tess_threads_per_patch = GraphicsPipeline.ThreadsPerPatch;
-      if (!GraphicsPipeline.PipelineState)
+      if (!GraphicsPipeline.PipelineState) {
+        render_encoder->last_pso = {};
         return;
+      }
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       cmd.type = WMTRenderCommandSetPSO;
       cmd.pso = GraphicsPipeline.PipelineState;
@@ -4757,13 +5243,19 @@ public:
     MTL_GRAPHICS_PIPELINE_DESC pipelineDesc;
     InitializeGraphicsPipelineDesc<IndexedDraw>(pipelineDesc);
     device->CreateGeometryPipeline(&pipelineDesc, &pipeline);
-    EmitST([pso = std::move(pipeline)](ArgumentEncodingContext& enc) {
+    EmitST([pso = std::move(pipeline), allow_async = AsyncPipelineCompilation(m_parent)](ArgumentEncodingContext& enc) {
       auto render_encoder = enc.currentRenderEncoder();
       render_encoder->use_geometry = 1;
       MTL_COMPILED_GRAPHICS_PIPELINE GraphicsPipeline{};
-      pso->GetPipeline(&GraphicsPipeline); // may block
-      if (!GraphicsPipeline.PipelineState)
+      if (allow_async && !PipelineReadyWithinBudget(enc, pso)) {
+        render_encoder->last_pso = {};
         return;
+      }
+      pso->GetPipeline(&GraphicsPipeline);
+      if (!GraphicsPipeline.PipelineState) {
+        render_encoder->last_pso = {};
+        return;
+      }
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       cmd.type = WMTRenderCommandSetPSO;
       cmd.pso = GraphicsPipeline.PipelineState;
@@ -4815,11 +5307,17 @@ public:
     InitializeGraphicsPipelineDesc<IndexedDraw>(pipelineDesc);
 
     device->CreateGraphicsPipeline(&pipelineDesc, &pipeline);
-    EmitST([pso = std::move(pipeline)](ArgumentEncodingContext& enc) {
+    EmitST([pso = std::move(pipeline), allow_async = AsyncPipelineCompilation(m_parent)](ArgumentEncodingContext& enc) {
       MTL_COMPILED_GRAPHICS_PIPELINE GraphicsPipeline{};
-      pso->GetPipeline(&GraphicsPipeline); // may block
-      if (!GraphicsPipeline.PipelineState)
+      if (allow_async && !PipelineReadyWithinBudget(enc, pso)) {
+        enc.currentRenderEncoder()->last_pso = {};
         return;
+      }
+      pso->GetPipeline(&GraphicsPipeline);
+      if (!GraphicsPipeline.PipelineState) {
+        enc.currentRenderEncoder()->last_pso = {};
+        return;
+      }
       auto &cmd = enc.encodeRenderCommand<wmtcmd_render_setpso>();
       cmd.type = WMTRenderCommandSetPSO;
       cmd.pso = GraphicsPipeline.PipelineState;
@@ -5135,6 +5633,7 @@ public:
 
 protected:
   D3D11ContextState state_;
+  Com<MTLD3D11DeviceContextState, false> state_object_; // see SwapDeviceContextState
   D3D11UserDefinedAnnotation annotation_;
   MTLD3D11ContextExt<ContextInternalState> ext_;
   uint64_t max_object_threadgroups_;

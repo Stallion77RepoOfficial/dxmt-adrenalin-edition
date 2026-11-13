@@ -390,9 +390,11 @@ convert_dxbc_vertex_hull_shader(
         builder.CreateExtractValue(draw_arguments, 0), builder.getInt32(pHullStage->input_control_point_count)
     );
 
-    resource_map.input.ptr_int4 = builder.CreateAlloca(llvm::ArrayType::get(types._int4, max_input_register));
+    resource_map.input.elem_type_int4 = llvm::ArrayType::get(types._int4, max_input_register);
+    resource_map.input.elem_type_float4 = llvm::ArrayType::get(types._float4, max_input_register);
+    resource_map.input.ptr_int4 = builder.CreateAlloca(resource_map.input.elem_type_int4);
     resource_map.input.ptr_float4 = builder.CreateBitCast(
-        resource_map.input.ptr_int4, llvm::ArrayType::get(types._float4, max_input_register)->getPointerTo()
+        resource_map.input.ptr_int4, resource_map.input.elem_type_float4->getPointerTo()
     );
     resource_map.input_element_count = max_input_register;
 
@@ -403,6 +405,8 @@ convert_dxbc_vertex_hull_shader(
     resource_map.output.ptr_float4 = builder.CreateBitCast(
         resource_map.output.ptr_int4, output_reg_per_point_type_float->getPointerTo(vertex_out->getAddressSpace())
     );
+    resource_map.output.elem_type_int4 = output_reg_per_point_type;
+    resource_map.output.elem_type_float4 = output_reg_per_point_type_float;
 
     resource_map.output_element_count = max_output_register;
 
@@ -496,6 +500,8 @@ convert_dxbc_vertex_hull_shader(
     resource_map.input.ptr_float4 = builder.CreateBitCast(
         resource_map.input.ptr_int4, output_reg_per_patch_type_float->getPointerTo(vertex_out->getAddressSpace())
     );
+    resource_map.input.elem_type_int4 = output_reg_per_patch_type;
+    resource_map.input.elem_type_float4 = output_reg_per_patch_type_float;
     resource_map.input_element_count = vertex_max_output_register;
 
     resource_map.instance_id = instance_id;
@@ -543,6 +549,8 @@ convert_dxbc_vertex_hull_shader(
               cast<llvm::PointerType>(resource_map.output.ptr_int4->getType())->getPointerAddressSpace()
           )
       );
+      resource_map.output.elem_type_int4 = hs_output_per_patch_type;
+      resource_map.output.elem_type_float4 = hs_output_per_patch_type_float;
       resource_map.output_element_count = max_hs_output_register;
     } else {
       /* since no control point phase */
@@ -554,6 +562,8 @@ convert_dxbc_vertex_hull_shader(
       }
       resource_map.output.ptr_float4 = resource_map.input.ptr_float4;
       resource_map.output.ptr_int4 = resource_map.input.ptr_int4;
+      resource_map.output.elem_type_int4 = resource_map.input.elem_type_int4;
+      resource_map.output.elem_type_float4 = resource_map.input.elem_type_float4;
       resource_map.output_element_count = resource_map.input_element_count;
 
       resource_map.hull_cp_passthrough_dst = builder.CreateGEP(
@@ -581,6 +591,8 @@ convert_dxbc_vertex_hull_shader(
           resource_map.patch_constant_output.ptr_int4,
           hs_pcout_per_patch_type_float->getPointerTo((uint32_t)air::AddressSpace::threadgroup)
       );
+      resource_map.patch_constant_output.elem_type_int4 = hs_pcout_per_patch_type;
+      resource_map.patch_constant_output.elem_type_float4 = hs_pcout_per_patch_type_float;
     }
 
     struct context ctx {
@@ -903,19 +915,25 @@ convert_dxbc_tesselator_domain_shader(
   );
   resource_map.input.ptr_float4 =
       builder.CreateBitCast(resource_map.input.ptr_int4, hs_output_per_patch_type_float->getPointerTo(6));
+  resource_map.input.elem_type_int4 = hs_output_per_patch_type;
+  resource_map.input.elem_type_float4 = hs_output_per_patch_type_float;
   resource_map.input_element_count = pHullStage->max_output_register;
 
+  resource_map.patch_constant_output.elem_type_int4 = llvm::ArrayType::get(types._int4, max_input_register);
+  resource_map.patch_constant_output.elem_type_float4 = llvm::ArrayType::get(types._float4, max_input_register);
   resource_map.patch_constant_output.ptr_int4 =
-      builder.CreateAlloca(llvm::ArrayType::get(types._int4, max_input_register));
+      builder.CreateAlloca(resource_map.patch_constant_output.elem_type_int4);
   resource_map.patch_constant_output.ptr_float4 = builder.CreateBitCast(
       resource_map.patch_constant_output.ptr_int4,
-      llvm::ArrayType::get(types._float4, max_input_register)->getPointerTo()
+      resource_map.patch_constant_output.elem_type_float4->getPointerTo()
   );
 
-  resource_map.output.ptr_int4 = builder.CreateAlloca(llvm::ArrayType::get(types._int4, max_output_register));
+  resource_map.output.elem_type_int4 = llvm::ArrayType::get(types._int4, max_output_register);
+  resource_map.output.elem_type_float4 = llvm::ArrayType::get(types._float4, max_output_register);
+  resource_map.output.ptr_int4 = builder.CreateAlloca(resource_map.output.elem_type_int4);
   resource_map.output.ptr_float4 = builder.CreateBitCast(
       resource_map.output.ptr_int4,
-      llvm::ArrayType::get(types._float4, max_output_register)->getPointerTo(
+      resource_map.output.elem_type_float4->getPointerTo(
           cast<llvm::PointerType>(resource_map.output.ptr_int4->getType())->getPointerAddressSpace()
       )
   );

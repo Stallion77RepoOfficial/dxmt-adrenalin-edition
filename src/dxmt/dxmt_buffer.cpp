@@ -59,6 +59,20 @@ BufferAllocation::free() {
   delete this;
 }
 
+BufferAllocation::BufferAllocation(WMT::Buffer buffer, const WMTBufferInfo &info, uint64_t base_offset) :
+    obj_(buffer), info_(info), mappedMemory_(info_.memory.get_accessible_or_null()),
+    gpuAddress_(info.gpu_address), suballocation_size_(info.length), base_offset_(base_offset) {
+  if (info.options & WMTResourceStorageModePrivate)
+    flags_.set(BufferAllocationFlag::GpuPrivate);
+  fenceTrackers.resize(1);
+}
+
+Rc<BufferAllocation>
+Buffer::importBuffer(WMT::Buffer buffer, const WMTBufferInfo &info, uint64_t offset) {
+  if (!buffer || !info.length || info.length != length_) return nullptr;
+  return new BufferAllocation(buffer, info, offset);
+}
+
 WMT::Texture
 Buffer::view(BufferViewKey key) {
   return view(key, current_.ptr());
@@ -125,7 +139,7 @@ Buffer::prepareAllocationViews(BufferAllocation *allocation) {
     }
     info.usage = usage;
 
-    auto view = allocation->obj_.newTexture(info, 0, total_length);
+    auto view = allocation->obj_.newTexture(info, allocation->base_offset_, total_length);
 
     allocation->cached_view_.push_back(std::make_unique<BufferView>(
         std::move(view), info.gpu_resource_id, allocation->suballocation_size_ / texel_size

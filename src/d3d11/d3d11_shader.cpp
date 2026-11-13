@@ -4,6 +4,7 @@
 #include "config/config.hpp"
 #include "d3d11_input_layout.hpp"
 #include "sha1/sha1_util.hpp"
+#include <atomic>
 #include <mutex>
 
 namespace dxmt {
@@ -33,6 +34,7 @@ public:
     sm50_common.metal_version = (SM50_SHADER_METAL_VERSION)pDevice->GetDXMTDevice().metalVersion();
     sm50_common.flags = getGlobalShaderFlag();
     sm50_common.next = nullptr;
+    ready_.store(false, std::memory_order_relaxed);
   }
 
   ~GeneralShaderCompileTask() {}

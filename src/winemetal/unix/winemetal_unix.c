@@ -13,21 +13,15 @@
 #define WINEMETAL_API
 #include "../winemetal_thunks.h"
 #include "../airconv_thunks.h"
+#include "msc_unix.h"
 
 typedef int NTSTATUS;
 #define STATUS_SUCCESS 0
 #define STATUS_UNSUCCESSFUL 0xC0000001
 
-// When the user requests the DXMT HUD (DXMT_HUD), enable Apple's Metal
-// performance HUD on DXMT's behalf so the user never has to set MTLHUDEnabled
-// themselves. Runs at library load, before any Metal device is created, which
-// is when the framework samples this variable.
-__attribute__((constructor)) static void
-dxmt_enable_metal_hud(void) {
-  const char *hud = getenv("DXMT_HUD");
-  if (hud && hud[0] != '\0' && strcmp(hud, "0") != 0)
-    setenv("MTLHUDEnabled", "1", 1);
-}
+/* DXMT_HUD is bridged to Apple's Metal Performance HUD by DXGI. The
+ * constructor-time MTL_HUD_ENABLED coupling is gone; callers opt in through
+ * _WMTEnableDeveloperHUD instead. */
 
 void
 execute_on_main(dispatch_block_t block) {
@@ -279,6 +273,44 @@ extract_texture_descriptor(id<MTLTexture> desc, struct WMTTextureInfo *info) {
   info->reserved = 0;
 };
 
+/* Metal raises an NSException for a descriptor it will not accept -- an
+ * unsupported sample count, a zero dimension, a format the device does not
+ * have. An exception escaping here crosses the unix-call boundary, which Wine
+ * reports as a failed call, and the PE side asserts on that and takes the
+ * process down.
+ *
+ * D3D's contract is to refuse the resource, not to kill the caller, so the
+ * exception becomes a nil texture. Validating every rule Metal enforces is not
+ * something this layer can enumerate; catching the refusal is. */
+static id<MTLTexture>
+new_texture_or_nil(id<MTLDevice> device, MTLTextureDescriptor *desc) {
+  @try {
+    return [device newTextureWithDescriptor:desc];
+  } @catch (NSException *exception) {
+    return nil;
+  }
+}
+
+static id<MTLTexture>
+new_heap_texture_or_nil(id<MTLHeap> heap, MTLTextureDescriptor *desc, NSUInteger offset) {
+  @try {
+    return [heap newTextureWithDescriptor:desc offset:offset];
+  } @catch (NSException *exception) {
+    return nil;
+  }
+}
+
+static id<MTLTexture>
+new_buffer_texture_or_nil(
+    id<MTLBuffer> buffer, MTLTextureDescriptor *desc, NSUInteger offset, NSUInteger bytes_per_row
+) {
+  @try {
+    return [buffer newTextureWithDescriptor:desc offset:offset bytesPerRow:bytes_per_row];
+  } @catch (NSException *exception) {
+    return nil;
+  }
+}
+
 static NTSTATUS
 _MTLDevice_newTexture(void *obj) {
   struct unixcall_mtldevice_newtexture *params = obj;
@@ -287,10 +319,12 @@ _MTLDevice_newTexture(void *obj) {
   MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
   fill_texture_descriptor(desc, info);
 
-  id<MTLTexture> ret = [device newTextureWithDescriptor:desc];
+  id<MTLTexture> ret = new_texture_or_nil(device, desc);
   params->ret = (obj_handle_t)ret;
-  info->gpu_resource_id = [ret gpuResourceID]._impl;
-  info->mach_port = 0;
+  if (ret) {
+    info->gpu_resource_id = [ret gpuResourceID]._impl;
+    info->mach_port = 0;
+  }
 
   [desc release];
   return STATUS_SUCCESS;
@@ -304,7 +338,7 @@ _MTLBuffer_newTexture(void *obj) {
   MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
   fill_texture_descriptor(desc, info);
 
-  id<MTLTexture> ret = [buffer newTextureWithDescriptor:desc offset:params->offset bytesPerRow:params->bytes_per_row];
+  id<MTLTexture> ret = new_buffer_texture_or_nil(buffer, desc, params->offset, params->bytes_per_row);
   params->ret = (obj_handle_t)ret;
   info->gpu_resource_id = [ret gpuResourceID]._impl;
   info->mach_port = 0;
@@ -315,6 +349,17 @@ _MTLBuffer_newTexture(void *obj) {
 
 static inline MTLTextureSwizzleChannels
 to_metal_swizzle(struct WMTTextureSwizzleChannels swizzle, enum WMTPixelFormat format) {
+  if (format & WMTPixelFormatRRRRSwizzle) {
+    return MTLTextureSwizzleChannelsMake(
+        (MTLTextureSwizzle)swizzle.r, (MTLTextureSwizzle)swizzle.r, (MTLTextureSwizzle)swizzle.r,
+        (MTLTextureSwizzle)swizzle.r
+    );
+  }
+  if (format & WMTPixelFormatGR11Swizzle) {
+    return MTLTextureSwizzleChannelsMake(
+        (MTLTextureSwizzle)swizzle.g, (MTLTextureSwizzle)swizzle.r, MTLTextureSwizzleOne, MTLTextureSwizzleOne
+    );
+  }
   if (format & WMTPixelFormatRGB1Swizzle) {
     return MTLTextureSwizzleChannelsMake(
         (MTLTextureSwizzle)swizzle.r, (MTLTextureSwizzle)swizzle.g, (MTLTextureSwizzle)swizzle.b, MTLTextureSwizzleOne
@@ -328,6 +373,27 @@ to_metal_swizzle(struct WMTTextureSwizzleChannels swizzle, enum WMTPixelFormat f
   if (format & WMTPixelFormat0R01Swizzle) {
     return MTLTextureSwizzleChannelsMake(
         MTLTextureSwizzleOne, (MTLTextureSwizzle)swizzle.r, MTLTextureSwizzleOne, MTLTextureSwizzleOne
+    );
+  }
+  if (format & WMTPixelFormatRRR1Swizzle) {
+    return MTLTextureSwizzleChannelsMake(
+        (MTLTextureSwizzle)swizzle.r, (MTLTextureSwizzle)swizzle.r, (MTLTextureSwizzle)swizzle.r, MTLTextureSwizzleOne
+    );
+  }
+  if (format & WMTPixelFormatRRRGSwizzle) {
+    return MTLTextureSwizzleChannelsMake(
+        (MTLTextureSwizzle)swizzle.r, (MTLTextureSwizzle)swizzle.r, (MTLTextureSwizzle)swizzle.r,
+        (MTLTextureSwizzle)swizzle.g
+    );
+  }
+  if (format & WMTPixelFormatRG11Swizzle) {
+    return MTLTextureSwizzleChannelsMake(
+        (MTLTextureSwizzle)swizzle.r, (MTLTextureSwizzle)swizzle.g, MTLTextureSwizzleOne, MTLTextureSwizzleOne
+    );
+  }
+  if (format & WMTPixelFormatR111Swizzle) {
+    return MTLTextureSwizzleChannelsMake(
+        (MTLTextureSwizzle)swizzle.r, MTLTextureSwizzleOne, MTLTextureSwizzleOne, MTLTextureSwizzleOne
     );
   }
   if (format & WMTPixelFormatGBARSwizzle) {
@@ -371,7 +437,7 @@ _MTLDevice_newLibrary(void *obj) {
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   NSError *err = NULL;
   params->ret_library = (obj_handle_t)[device newLibraryWithData:(dispatch_data_t)params->data error:&err];
-  params->ret_error = (obj_handle_t)err;
+  params->ret_error = (obj_handle_t)[err retain];
   return STATUS_SUCCESS;
 }
 
@@ -404,6 +470,13 @@ _MTLDevice_newComputePipelineState(void *obj) {
   struct unixcall_mtldevice_newcomputepso *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   const struct WMTComputePipelineInfo *info = params->info.ptr;
+
+  if (!info->compute_function) {
+    params->ret_pso = 0;
+    params->ret_error = 0;
+    return STATUS_SUCCESS;
+  }
+
   MTLComputePipelineDescriptor *descriptor = [[MTLComputePipelineDescriptor alloc] init];
   NSError *err = NULL;
   descriptor.computeFunction = (id<MTLFunction>)info->compute_function;
@@ -419,7 +492,7 @@ _MTLDevice_newComputePipelineState(void *obj) {
       info->fail_on_binary_archive_miss ? MTLPipelineOptionFailOnBinaryArchiveMiss : MTLPipelineOptionNone;
   params->ret_pso =
       (obj_handle_t)[device newComputePipelineStateWithDescriptor:descriptor options:options reflection:nil error:&err];
-  params->ret_error = (obj_handle_t)err;
+  params->ret_error = (obj_handle_t)[err retain];
   if (!err && info->binary_archive_for_serialization) {
     [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addComputePipelineFunctionsWithDescriptor:descriptor
                                                                                                       error:&err];
@@ -473,6 +546,13 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
     descriptor.depthAttachment.texture = (id<MTLTexture>)info->depth.texture;
     descriptor.depthAttachment.loadAction = (MTLLoadAction)info->depth.load_action;
     descriptor.depthAttachment.storeAction = (MTLStoreAction)info->depth.store_action;
+    if (info->depth.resolve_texture) {
+      descriptor.depthAttachment.resolveTexture = (id<MTLTexture>)info->depth.resolve_texture;
+      descriptor.depthAttachment.resolveLevel = info->depth.resolve_level;
+      descriptor.depthAttachment.resolveSlice = info->depth.resolve_slice;
+      descriptor.depthAttachment.resolveDepthPlane = info->depth.resolve_depth_plane;
+      descriptor.depthAttachment.depthResolveFilter = (MTLMultisampleDepthResolveFilter)info->depth.resolve_filter;
+    }
   }
 
   if (info->stencil.texture) {
@@ -483,6 +563,14 @@ _MTLCommandBuffer_renderCommandEncoder(void *obj) {
     descriptor.stencilAttachment.texture = (id<MTLTexture>)info->stencil.texture;
     descriptor.stencilAttachment.loadAction = (MTLLoadAction)info->stencil.load_action;
     descriptor.stencilAttachment.storeAction = (MTLStoreAction)info->stencil.store_action;
+    if (info->stencil.resolve_texture) {
+      descriptor.stencilAttachment.resolveTexture = (id<MTLTexture>)info->stencil.resolve_texture;
+      descriptor.stencilAttachment.resolveLevel = info->stencil.resolve_level;
+      descriptor.stencilAttachment.resolveSlice = info->stencil.resolve_slice;
+      descriptor.stencilAttachment.resolveDepthPlane = info->stencil.resolve_depth_plane;
+      descriptor.stencilAttachment.stencilResolveFilter =
+          (MTLMultisampleStencilResolveFilter)info->stencil.resolve_filter;
+    }
   }
 
   descriptor.defaultRasterSampleCount = info->default_raster_sample_count;
@@ -552,7 +640,38 @@ static NTSTATUS
 _MTLDevice_newRenderPipelineState(void *obj) {
   struct unixcall_mtldevice_newrenderpso *params = obj;
   const struct WMTRenderPipelineInfo *info = params->info.ptr;
+
+  if (!info->vertex_function) {
+    params->ret_pso = 0;
+    params->ret_error = 0;
+    return STATUS_SUCCESS;
+  }
+
   MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+
+  /* Hardware vertex fetch. Shaders that fetch their own vertices leave this
+   * null and keep the descriptor without one. */
+  if (info->vertex_descriptor.ptr) {
+    const struct WMTVertexDescriptorInfo *vertex_info = info->vertex_descriptor.ptr;
+    const struct WMTVertexAttributeDesc *attributes = vertex_info->attributes.ptr;
+    const struct WMTVertexBufferLayoutDesc *layouts = vertex_info->layouts.ptr;
+    MTLVertexDescriptor *vertex_descriptor = [MTLVertexDescriptor vertexDescriptor];
+
+    for (uint32_t i = 0; attributes && i < vertex_info->num_attributes; i++) {
+      MTLVertexAttributeDescriptor *attribute = vertex_descriptor.attributes[attributes[i].index];
+      attribute.format = (MTLVertexFormat)attributes[i].format;
+      attribute.offset = attributes[i].offset;
+      attribute.bufferIndex = attributes[i].buffer_index;
+    }
+    for (uint32_t i = 0; layouts && i < vertex_info->num_layouts; i++) {
+      MTLVertexBufferLayoutDescriptor *layout = vertex_descriptor.layouts[layouts[i].index];
+      layout.stride = layouts[i].stride;
+      layout.stepFunction = (MTLVertexStepFunction)layouts[i].step_function;
+      layout.stepRate = layouts[i].step_rate;
+    }
+
+    descriptor.vertexDescriptor = vertex_descriptor;
+  }
 
   for (unsigned i = 0; i < 8; i++) {
     descriptor.colorAttachments[i].pixelFormat = to_metal_pixel_format(info->colors[i].pixel_format);
@@ -603,7 +722,7 @@ _MTLDevice_newRenderPipelineState(void *obj) {
                                                                                               options:options
                                                                                            reflection:nil
                                                                                                 error:&err];
-  params->ret_error = (obj_handle_t)err;
+  params->ret_error = (obj_handle_t)[err retain];
   if (!err && info->binary_archive_for_serialization) {
     [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addRenderPipelineFunctionsWithDescriptor:descriptor
                                                                                                      error:&err];
@@ -673,7 +792,7 @@ _MTLDevice_newMeshRenderPipelineState(void *obj) {
                                                                                                   options:options
                                                                                                reflection:nil
                                                                                                     error:&err];
-  params->ret_error = (obj_handle_t)err;
+  params->ret_error = (obj_handle_t)[err retain];
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
   if (@available(macOS 15, *)) {
     if (!err && info->binary_archive_for_serialization) {
@@ -942,6 +1061,11 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandSetFragmentBytes: {
       struct wmtcmd_render_setbytes *body = (struct wmtcmd_render_setbytes *)next;
       [encoder setFragmentBytes:body->bytes.ptr length:body->length atIndex:body->index];
+      break;
+    }
+    case WMTRenderCommandSetVertexBytes: {
+      struct wmtcmd_render_setbytes *body = (struct wmtcmd_render_setbytes *)next;
+      [encoder setVertexBytes:body->bytes.ptr length:body->length atIndex:body->index];
       break;
     }
     case WMTRenderCommandSetFragmentTexture: {
@@ -1269,6 +1393,21 @@ _MTLTexture_replaceRegion(void *obj) {
 }
 
 static NTSTATUS
+_MTLTexture_getBytes(void *obj) {
+  struct unixcall_mtltexture_getbytes *params = obj;
+  [(id<MTLTexture>)params->texture getBytes:params->data.ptr
+                                bytesPerRow:params->bytes_per_row
+                              bytesPerImage:params->bytes_per_image
+                                 fromRegion:MTLRegionMake3D(
+                                                params->origin.x, params->origin.y, params->origin.z,
+                                                params->size.width, params->size.height, params->size.depth
+                                            )
+                                mipmapLevel:params->level
+                                      slice:params->slice];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLBuffer_didModifyRange(void *obj) {
   struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
   [(id<MTLBuffer>)params->handle didModifyRange:NSMakeRange(params->arg, params->ret)];
@@ -1508,10 +1647,13 @@ _NSString_alloc_init(void *obj) {
 // by the PE side from the Windows environment, which under CrossOver is not the
 // same environment the unix-side constructor sees, so the constructor's getenv
 // may miss it. The PE side calls this before device creation as a reliable
-// bridge. setenv is honoured because Metal samples MTLHUDEnabled when the device
-// is created, which always happens after the first unix call.
+// bridge. setenv is honoured because Metal samples the variable when the device
+// is created, which always happens after the first unix call. The HUD is keyed
+// on MTL_HUD_ENABLED (the variable Apple's Metal Performance HUD actually reads);
+// MTLHUDEnabled is also set for older toolchains that used that name.
 static NTSTATUS
 _WMTEnableDeveloperHUD(void *obj) {
+  setenv("MTL_HUD_ENABLED", "1", 1);
   setenv("MTLHUDEnabled", "1", 1);
   return STATUS_SUCCESS;
 }
@@ -1616,8 +1758,28 @@ typedef struct macdrv_opaque_window *macdrv_window;
 typedef struct macdrv_opaque_window_data *macdrv_window_data;
 typedef struct opaque_window_surface *window_surface;
 typedef struct opaque_HWND *HWND;
+/* Mirror of winemac.drv's own struct, which is private to it. Only the leading
+ * fields are named: everything after client_view is layout we do not read.
+ *
+ * This is version-sensitive by nature. It matches Wine 11.11, where the
+ * separate cocoa_view is gone and client_cocoa_view has become client_view --
+ * an older mirror reads client_view where cocoa_view used to be and the window
+ * rectangle where the client view used to be. */
 struct macdrv_win_data {
   HWND hwnd; /* hwnd that this private data belongs to */
+  macdrv_window cocoa_window;
+  macdrv_view client_view;
+};
+
+/* What get_win_data hands back comes in one of two layouts. Wine's own (11.11
+ * on), which a winemac.drv marks by exporting macdrv_win_data_native: its
+ * client view only exists once a client surface has presented, and the
+ * window's content view comes from an extra macdrv_functions slot. And the
+ * layout D3DMetal fixed, which CrossOver's winemac.drv rebuilds for each swap
+ * chain -- a client view it creates on the spot -- and which has no such slot
+ * (its eleventh entry is RegQueryValueExA). */
+struct macdrv_win_data_classic {
+  HWND hwnd;
   macdrv_window cocoa_window;
   macdrv_view cocoa_view;
   macdrv_view client_cocoa_view;
@@ -1634,6 +1796,7 @@ struct macdrv_functions_t {
   macdrv_metal_layer (*macdrv_view_get_metal_layer)(macdrv_metal_view v);
   void (*macdrv_view_release_metal_view)(macdrv_metal_view v);
   void (*on_main_thread)(dispatch_block_t b);
+  macdrv_view (*macdrv_window_get_content_view)(macdrv_window w);
 };
 
 static NTSTATUS
@@ -1644,30 +1807,52 @@ _CreateMetalViewFromHWND(void *obj) {
   void (*pfn_release_win_data)(struct macdrv_win_data *data) = NULL;
   macdrv_metal_view (*pfn_macdrv_view_create_metal_view)(macdrv_view v, macdrv_metal_device d) = NULL;
   macdrv_metal_layer (*pfn_macdrv_view_get_metal_layer)(macdrv_metal_view v) = NULL;
+  macdrv_view (*pfn_macdrv_window_get_content_view)(macdrv_window w) = NULL;
 
+  const int native_layout = dlsym(RTLD_DEFAULT, "macdrv_win_data_native") != NULL;
   struct macdrv_functions_t *macdrv_functions;
   if ((macdrv_functions = dlsym(RTLD_DEFAULT, "macdrv_functions"))) {
     pfn_get_win_data = macdrv_functions->get_win_data;
     pfn_release_win_data = macdrv_functions->release_win_data;
     pfn_macdrv_view_create_metal_view = macdrv_functions->macdrv_view_create_metal_view;
     pfn_macdrv_view_get_metal_layer = macdrv_functions->macdrv_view_get_metal_layer;
+    if (native_layout)
+      pfn_macdrv_window_get_content_view = macdrv_functions->macdrv_window_get_content_view;
   } else {
     pfn_get_win_data = dlsym(RTLD_DEFAULT, "get_win_data");
     pfn_release_win_data = dlsym(RTLD_DEFAULT, "release_win_data");
     pfn_macdrv_view_create_metal_view = dlsym(RTLD_DEFAULT, "macdrv_view_create_metal_view");
     pfn_macdrv_view_get_metal_layer = dlsym(RTLD_DEFAULT, "macdrv_view_get_metal_layer");
+    pfn_macdrv_window_get_content_view = dlsym(RTLD_DEFAULT, "macdrv_window_get_content_view");
   }
 
   if (pfn_get_win_data && pfn_release_win_data && pfn_macdrv_view_create_metal_view &&
       pfn_macdrv_view_get_metal_layer) {
     struct macdrv_win_data *win_data = pfn_get_win_data((HWND)params->hwnd);
-    macdrv_metal_view view =
-        pfn_macdrv_view_create_metal_view(win_data->client_cocoa_view, (macdrv_metal_device)params->device);
-    params->ret_view = (obj_handle_t)view;
-    if (view) {
-      params->ret_layer = (obj_handle_t)pfn_macdrv_view_get_metal_layer(view);
+    if (win_data) {
+      /* client_view is created when a client surface first presents, so it is
+       * usually NULL here -- a swap chain is set up before any frame exists.
+       * The window's content view is always there, and is what the client view
+       * is a sibling of. */
+      macdrv_view view;
+      if (native_layout) {
+        view = win_data->client_view;
+        if (!view && pfn_macdrv_window_get_content_view && win_data->cocoa_window)
+          view = pfn_macdrv_window_get_content_view(win_data->cocoa_window);
+      } else {
+        struct macdrv_win_data_classic *classic = (struct macdrv_win_data_classic *)win_data;
+        view = classic->client_cocoa_view ? classic->client_cocoa_view : classic->cocoa_view;
+      }
+
+      if (view) {
+        macdrv_metal_view metal_view =
+            pfn_macdrv_view_create_metal_view(view, (macdrv_metal_device)params->device);
+        params->ret_view = (obj_handle_t)metal_view;
+        if (metal_view)
+          params->ret_layer = (obj_handle_t)pfn_macdrv_view_get_metal_layer(metal_view);
+      }
+      pfn_release_win_data(win_data);
     }
-    pfn_release_win_data(win_data);
   }
 
   return STATUS_SUCCESS;
@@ -2264,16 +2449,25 @@ GetChromaticity_xy(ColorSyncProfileRef profile, CFStringRef tag, float *out_x, f
   CFDataRef tag_data = ColorSyncProfileCopyTag(profile, tag);
   if (!tag_data)
     return false;
-  if (CFDataGetLength(tag_data) != sizeof(icc_XYZ_t))
+  if (CFDataGetLength(tag_data) != sizeof(icc_XYZ_t)) {
+    CFRelease(tag_data);
     return false;
+  }
   icc_XYZ_t *data = (icc_XYZ_t *)CFDataGetBytePtr(tag_data);
-  if (data->sig != 0x205a5958)
+  if (data->sig != 0x205a5958) {
+    CFRelease(tag_data);
     return false;
+  }
   double X = (int32_t)__builtin_bswap32(data->x) / 65536.0;
   double Y = (int32_t)__builtin_bswap32(data->y) / 65536.0;
   double Z = (int32_t)__builtin_bswap32(data->z) / 65536.0;
+  if (X + Y + Z == 0.0) {
+    CFRelease(tag_data);
+    return false;
+  }
   *out_x = X / (X + Y + Z);
   *out_y = Y / (X + Y + Z);
+  CFRelease(tag_data);
   return true;
 }
 
@@ -2310,8 +2504,13 @@ _WMTGetDisplayDescription(void *obj) {
   CGDirectDisplayID display_id = params->handle;
   struct WMTDisplayDescription *desc_out = params->arg.ptr;
   ColorSyncProfileRef profile = ColorSyncProfileCreateWithDisplayID(display_id);
-  if (!profile || !GetDisplayColorGamut(profile, desc_out))
-    GetDisplayColorGamut(ColorSyncProfileCreateWithName(kColorSyncGenericRGBProfile), desc_out);
+  ColorSyncProfileRef fallback = NULL;
+  if (!profile || !GetDisplayColorGamut(profile, desc_out)) {
+    fallback = ColorSyncProfileCreateWithName(kColorSyncGenericRGBProfile);
+    if (fallback)
+      GetDisplayColorGamut(fallback, desc_out);
+  }
+  @autoreleasepool {
   NSScreen *screen = GetNSScreenForDisplayID(display_id);
   if (screen) {
     desc_out->maximum_edr_color_component_value = [screen maximumExtendedDynamicRangeColorComponentValue];
@@ -2324,6 +2523,11 @@ _WMTGetDisplayDescription(void *obj) {
     desc_out->maximum_reference_edr_color_component_value = 0.0;
     desc_out->maximum_potential_edr_color_component_value = 1.0;
   }
+  }
+  if (profile)
+    CFRelease(profile);
+  if (fallback)
+    CFRelease(fallback);
   return STATUS_SUCCESS;
 }
 
@@ -2374,7 +2578,7 @@ _MTLLibrary_newFunctionWithConstants(void *obj) {
     [values setConstantValue:constants[i].data.ptr type:(MTLDataType)constants[i].type atIndex:constants[i].index];
 
   params->ret = (obj_handle_t)[library newFunctionWithName:name constantValues:values error:&err];
-  params->ret_error = (obj_handle_t)err;
+  params->ret_error = (obj_handle_t)[err retain];
   [name release];
   [values release];
   return STATUS_SUCCESS;
@@ -2417,6 +2621,7 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
   CAMetalLayer *layer = (CAMetalLayer *)params->layer;
   struct WMTHDRMetadata *hdr_metadata_out = params->hdr_metadata.ptr;
 
+  @autoreleasepool {
   params->version = 0;
   if (![layer.delegate isKindOfClass:NSView.class])
     return STATUS_SUCCESS;
@@ -2439,6 +2644,7 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
       layer.wantsExtendedDynamicRangeContent ? screen.maximumExtendedDynamicRangeColorComponentValue : 1.0;
   params->edr_value.maximum_potential_edr_color_component_value =
       screen.maximumPotentialExtendedDynamicRangeColorComponentValue;
+  }
 
   return STATUS_SUCCESS;
 }
@@ -2573,7 +2779,23 @@ _MTLDevice_newEvent(void *obj) {
 static NTSTATUS
 _MTLBuffer_updateContents(void *obj) {
   struct unixcall_mtlbuffer_updatecontents *params = obj;
-  memcpy((void *)((char *)[(id<MTLBuffer>)params->buffer contents] + params->offset), params->data.ptr, params->length);
+  void *contents = [(id<MTLBuffer>)params->buffer contents];
+  uint64_t capacity = (uint64_t)[(id<MTLBuffer>)params->buffer length];
+  /* A fault in here is not recoverable the way a bad return value is: Wine
+   * turns it into a failed unix call, the thunk asserts, and the process is
+   * gone. So the arguments are checked rather than trusted -- a private
+   * buffer has no CPU-visible contents, and a null or overrunning source is a
+   * caller's mistake that should cost a missing update, not the process. */
+  if (!contents || !params->data.ptr || params->offset > capacity ||
+      params->length > capacity - params->offset)
+    /* Skipped, not reported. The PE side of this call returns void and
+     * asserts on any status but success, so a status here would kill the
+     * process exactly as the fault did. The callers are validated where the
+     * mistake is visible -- CreateBuffer and the CreateTexture family refuse
+     * a null pSysMem -- and this is the backstop that must not itself be
+     * fatal. */
+    return STATUS_SUCCESS;
+  memcpy((void *)((char *)contents + params->offset), params->data.ptr, params->length);
   if ([(id<MTLBuffer>)params->buffer storageMode] == MTLStorageModeManaged)
     [(id<MTLBuffer>)params->buffer didModifyRange:NSMakeRange(params->offset, params->length)];
   return STATUS_SUCCESS;
@@ -2602,7 +2824,7 @@ _MTLDevice_newBinaryArchive(void *obj) {
   }
   NSError *err = NULL;
   params->ret_archive = (obj_handle_t)[(id<MTLDevice>)params->device newBinaryArchiveWithDescriptor:desc error:&err];
-  params->ret_error = (obj_handle_t)err;
+  params->ret_error = (obj_handle_t)[err retain];
   [desc release];
   if (url)
     [url release];
@@ -2618,7 +2840,7 @@ _MTLBinaryArchive_serialize(void *obj) {
   NSURL *url = [[NSURL alloc] initFileURLWithPath:path_str];
   NSError *err = NULL;
   [(id<MTLBinaryArchive>)params->archive serializeToURL:url error:&err];
-  params->ret_error = (obj_handle_t)err;
+  params->ret_error = (obj_handle_t)[err retain];
   [url release];
   [path_str release];
   return STATUS_SUCCESS;
@@ -2866,7 +3088,7 @@ _MTLDevice_newTileRenderPipelineState(void *obj) {
                                                                                                   options:options
                                                                                                reflection:nil
                                                                                                     error:&err];
-  params->ret_error = (obj_handle_t)err;
+  params->ret_error = (obj_handle_t)[err retain];
 #if __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
   if (@available(macOS 15, *)) {
     if (!err && info->binary_archive_for_serialization) {
@@ -2889,6 +3111,141 @@ NTSTATUS _CacheReader_get(void *obj);
 NTSTATUS _CacheWriter_alloc_init(void *obj);
 NTSTATUS _CacheWriter_set(void *obj);
 NTSTATUS _WMTSetMetalShaderCachePath(void *obj);
+
+static NTSTATUS
+_MTLDevice_newHeap(void *obj) {
+  struct unixcall_mtldevice_newheap *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  const struct WMTHeapInfo *info = params->info.ptr;
+  MTLHeapDescriptor *desc = [[MTLHeapDescriptor alloc] init];
+
+  desc.size = info->size;
+  desc.resourceOptions = (enum MTLResourceOptions)info->options;
+  desc.type = (MTLHeapType)info->type;
+
+  params->ret = (obj_handle_t)[device newHeapWithDescriptor:desc];
+
+  [desc release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_heapBufferSizeAndAlign(void *obj) {
+  struct unixcall_mtldevice_heapbuffersizeandalign *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  struct WMTSizeAndAlign *out = params->out.ptr;
+  MTLSizeAndAlign result =
+      [device heapBufferSizeAndAlignWithLength:params->length options:(enum MTLResourceOptions)params->options];
+
+  out->size = result.size;
+  out->align = result.align;
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLDevice_heapTextureSizeAndAlign(void *obj) {
+  struct unixcall_mtldevice_heaptexturesizeandalign *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  struct WMTSizeAndAlign *out = params->out.ptr;
+  MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
+  MTLSizeAndAlign result;
+
+  fill_texture_descriptor(desc, (struct WMTTextureInfo *)params->info.ptr);
+  result = [device heapTextureSizeAndAlignWithDescriptor:desc];
+  out->size = result.size;
+  out->align = result.align;
+
+  [desc release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLHeap_newBuffer(void *obj) {
+  struct unixcall_mtlheap_newresource *params = obj;
+  id<MTLHeap> heap = (id<MTLHeap>)params->heap;
+  struct WMTBufferInfo *info = params->info.ptr;
+  id<MTLBuffer> buffer = [heap newBufferWithLength:info->length
+                                          options:(enum MTLResourceOptions)info->options
+                                           offset:params->offset];
+
+  params->ret = (obj_handle_t)buffer;
+  if (buffer) {
+    info->memory.ptr = [buffer storageMode] == MTLStorageModePrivate ? NULL : [buffer contents];
+    info->gpu_address = [buffer gpuAddress];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLHeap_newTexture(void *obj) {
+  struct unixcall_mtlheap_newresource *params = obj;
+  id<MTLHeap> heap = (id<MTLHeap>)params->heap;
+  struct WMTTextureInfo *info = params->info.ptr;
+  MTLTextureDescriptor *desc = [[MTLTextureDescriptor alloc] init];
+  id<MTLTexture> texture;
+
+  fill_texture_descriptor(desc, info);
+  texture = new_heap_texture_or_nil(heap, desc, params->offset);
+  params->ret = (obj_handle_t)texture;
+  if (texture) {
+    info->gpu_resource_id = [texture gpuResourceID]._impl;
+    info->mach_port = 0;
+  }
+
+  [desc release];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLFunction_vertexAttributes(void *obj) {
+  struct unixcall_mtlfunction_vertexattributes *params = obj;
+  id<MTLFunction> function = (id<MTLFunction>)params->function;
+  NSArray<MTLVertexAttribute *> *attributes = [function vertexAttributes];
+  struct WMTVertexAttributeInfo *out = params->out.ptr;
+
+  params->ret = (uint32_t)[attributes count];
+  if (!out)
+    return STATUS_SUCCESS;
+
+  uint32_t written = params->ret < params->capacity ? params->ret : params->capacity;
+  for (uint32_t i = 0; i < written; i++) {
+    MTLVertexAttribute *attribute = attributes[i];
+    out[i].index = (uint32_t)[attribute attributeIndex];
+    out[i].data_type = (uint32_t)[attribute attributeType];
+    out[i].active = [attribute isActive] ? 1 : 0;
+    out[i].padding[0] = out[i].padding[1] = out[i].padding[2] = 0;
+    /* Always NUL-terminated: the name is matched by string compare. */
+    const char *name = [[attribute name] UTF8String];
+    strncpy(out[i].name, name ? name : "", sizeof(out[i].name) - 1);
+    out[i].name[sizeof(out[i].name) - 1] = '\0';
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLHeap_property(void *obj) {
+  struct unixcall_mtlheap_property *params = obj;
+  id<MTLHeap> heap = (id<MTLHeap>)params->heap;
+
+  switch (params->prop) {
+  case WMTHeapPropertySize:
+    params->ret = [heap size];
+    break;
+  case WMTHeapPropertyUsedSize:
+    params->ret = [heap usedSize];
+    break;
+  case WMTHeapPropertyCurrentAllocatedSize:
+    params->ret = [heap currentAllocatedSize];
+    break;
+  case WMTHeapPropertyMaxAvailableSize:
+    params->ret = [heap maxAvailableSizeWithAlignment:params->arg];
+    break;
+  default:
+    params->ret = 0;
+    break;
+  }
+  return STATUS_SUCCESS;
+}
 
 const void *__wine_unix_call_funcs[] = {
     &_NSObject_retain,
@@ -3024,6 +3381,23 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLCommandBuffer_property,
     &_MTLDevice_newTileRenderPipelineState,
     &_WMTEnableDeveloperHUD,
+    &_WMTShaderConverterIsAvailable,
+    &_WMTShaderConverterCreateRootSignature,
+    &_WMTShaderConverterReleaseRootSignature,
+    &_WMTShaderConverterConvert,
+    &_WMTShaderConverterCopyReflectionJSON,
+    &_WMTShaderConverterReleaseReflection,
+    &_WMTShaderConverterCopyErrorMessage,
+    &_WMTShaderConverterReleaseError,
+    &_MTLDevice_newHeap,
+    &_MTLDevice_heapBufferSizeAndAlign,
+    &_MTLDevice_heapTextureSizeAndAlign,
+    &_MTLHeap_newBuffer,
+    &_MTLHeap_newTexture,
+    &_MTLHeap_property,
+    &_MTLFunction_vertexAttributes,
+    &_WMTShaderConverterCopyComputeInfo,
+    &_MTLTexture_getBytes,
 };
 
 #ifndef DXMT_NATIVE
@@ -3161,5 +3535,22 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLCommandBuffer_property,
     &_MTLDevice_newTileRenderPipelineState,
     &_WMTEnableDeveloperHUD,
+    &_WMTShaderConverterIsAvailable,
+    &_WMTShaderConverterCreateRootSignature,
+    &_WMTShaderConverterReleaseRootSignature,
+    &_WMTShaderConverterConvert,
+    &_WMTShaderConverterCopyReflectionJSON,
+    &_WMTShaderConverterReleaseReflection,
+    &_WMTShaderConverterCopyErrorMessage,
+    &_WMTShaderConverterReleaseError,
+    &_MTLDevice_newHeap,
+    &_MTLDevice_heapBufferSizeAndAlign,
+    &_MTLDevice_heapTextureSizeAndAlign,
+    &_MTLHeap_newBuffer,
+    &_MTLHeap_newTexture,
+    &_MTLHeap_property,
+    &_MTLFunction_vertexAttributes,
+    &_WMTShaderConverterCopyComputeInfo,
+    &_MTLTexture_getBytes,
 };
 #endif

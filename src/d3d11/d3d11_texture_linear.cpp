@@ -89,7 +89,7 @@ TDynamicLinearTexture(
 
 template<>
 HRESULT STDMETHODCALLTYPE TDynamicLinearTexture<tag_texture_2d>::CreateShaderResourceView(const D3D11_SHADER_RESOURCE_VIEW_DESC1 *pDesc, ID3D11ShaderResourceView1 **ppView){
-  D3D11_SHADER_RESOURCE_VIEW_DESC1 finalDesc;
+  D3D11_SHADER_RESOURCE_VIEW_DESC1 finalDesc = {};
   if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc, &finalDesc))) {
     return E_INVALIDARG;
   }
@@ -127,7 +127,7 @@ HRESULT STDMETHODCALLTYPE TDynamicLinearTexture<tag_texture_2d>::CreateShaderRes
 
 template<>
 HRESULT STDMETHODCALLTYPE TDynamicLinearTexture<tag_texture_1d>::CreateShaderResourceView(const D3D11_SHADER_RESOURCE_VIEW_DESC1 *pDesc, ID3D11ShaderResourceView1 **ppView){
-  D3D11_SHADER_RESOURCE_VIEW_DESC1 finalDesc;
+  D3D11_SHADER_RESOURCE_VIEW_DESC1 finalDesc = {};
   if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc, &finalDesc))) {
     return E_INVALIDARG;
   }
@@ -181,10 +181,11 @@ CreateDynamicLinearTexture2D(
   if (format.Flag & MTL_DXGI_FORMAT_BC) {
     return E_FAIL;
   }
-  if (format.Flag & MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL) {
-    ERR("CreateDynamicLinearTexture: depth-stencil resource cannot be dynamic");
+  /* Metal has no linear depth or stencil textures; those take the
+   * non-linear path. */
+  if (format.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER |
+                     MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL))
     return E_FAIL;
-  }
   if (format.PixelFormat == WMTPixelFormatInvalid) {
     return E_FAIL;
   }
@@ -218,10 +219,11 @@ CreateDynamicLinearTexture1D(
   if (format.Flag & MTL_DXGI_FORMAT_BC) {
     return E_FAIL;
   }
-  if (format.Flag & MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL) {
-    ERR("CreateDynamicLinearTexture: depth-stencil resource cannot be dynamic");
+  /* Metal has no linear depth or stencil textures; those take the
+   * non-linear path. */
+  if (format.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER |
+                     MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL))
     return E_FAIL;
-  }
   if (format.PixelFormat == WMTPixelFormatInvalid) {
     return E_FAIL;
   }

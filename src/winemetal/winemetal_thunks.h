@@ -143,6 +143,20 @@ struct unixcall_generic_obj_cmd_noret {
   struct WMTConstMemoryPointer cmd_head;
 };
 
+/* getBytes is the mirror of replaceRegion. Only the CPU-visible storage modes
+ * can serve it, which for a D3D12 placed texture means a heap the application
+ * asked to be readable. */
+struct unixcall_mtltexture_getbytes {
+  obj_handle_t texture;
+  struct WMTOrigin origin;
+  struct WMTSize size;
+  uint64_t level;
+  uint64_t slice;
+  struct WMTMemoryPointer data;
+  uint64_t bytes_per_row;
+  uint64_t bytes_per_image;
+};
+
 struct unixcall_mtltexture_replaceregion {
   obj_handle_t texture;
   struct WMTOrigin origin;
@@ -369,6 +383,47 @@ struct unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers {
   struct WMTMemoryPointer attachments;
   uint64_t num_attachments;
   obj_handle_t ret;
+};
+
+struct unixcall_mtldevice_newheap {
+  obj_handle_t device;
+  struct WMTConstMemoryPointer info;
+  obj_handle_t ret;
+};
+
+struct unixcall_mtldevice_heapbuffersizeandalign {
+  obj_handle_t device;
+  uint64_t length;
+  uint64_t options;
+  struct WMTMemoryPointer out;
+};
+
+struct unixcall_mtldevice_heaptexturesizeandalign {
+  obj_handle_t device;
+  struct WMTConstMemoryPointer info;
+  struct WMTMemoryPointer out;
+};
+
+struct unixcall_mtlheap_newresource {
+  obj_handle_t heap;
+  struct WMTMemoryPointer info;
+  uint64_t offset;
+  obj_handle_t ret;
+};
+
+struct unixcall_mtlfunction_vertexattributes {
+  obj_handle_t function;
+  struct WMTMemoryPointer out;
+  uint32_t capacity;
+  uint32_t ret;
+};
+
+struct unixcall_mtlheap_property {
+  obj_handle_t heap;
+  uint64_t arg;
+  uint32_t prop;
+  uint32_t padding;
+  uint64_t ret;
 };
 
 #pragma pack(pop)

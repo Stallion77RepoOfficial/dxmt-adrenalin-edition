@@ -80,6 +80,7 @@ public:
       PixelShader = nullptr;
       ps_valid_render_targets = 0;
     }
+    ready_.store(false, std::memory_order_relaxed);
   }
 
   void GetPipeline(MTL_COMPILED_TESSELLATION_MESH_PIPELINE *pPipeline) final {

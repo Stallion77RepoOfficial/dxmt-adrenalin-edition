@@ -260,6 +260,16 @@ public:
   }
 
   void
+  getBytes(
+      void *data, uint64_t bytesPerRow, uint64_t bytesPerImage, WMTOrigin origin, WMTSize size, uint64_t level,
+      uint64_t slice
+  ) {
+    WMTMemoryPointer ptr;
+    ptr.set(data);
+    return MTLTexture_getBytes(handle, ptr, bytesPerRow, bytesPerImage, origin, size, level, slice);
+  }
+
+  void
   replaceRegion(
       WMTOrigin origin, WMTSize size, uint64_t level, uint64_t slice, const void *pixelBytes, uint64_t bytesPerRow,
       uint64_t bytesPerImage
@@ -267,6 +277,34 @@ public:
     WMTMemoryPointer data;
     data.set((void *)pixelBytes);
     return MTLTexture_replaceRegion(handle, origin, size, level, slice, data, bytesPerRow, bytesPerImage);
+  }
+};
+
+class Buffer;
+
+class Heap : public Object {
+public:
+  Reference<Buffer> newBuffer(WMTBufferInfo &info, uint64_t offset);
+  Reference<Texture> newTexture(WMTTextureInfo &info, uint64_t offset);
+
+  uint64_t
+  size() {
+    return MTLHeap_property(handle, WMTHeapPropertySize, 0);
+  }
+
+  uint64_t
+  usedSize() {
+    return MTLHeap_property(handle, WMTHeapPropertyUsedSize, 0);
+  }
+
+  uint64_t
+  currentAllocatedSize() {
+    return MTLHeap_property(handle, WMTHeapPropertyCurrentAllocatedSize, 0);
+  }
+
+  uint64_t
+  maxAvailableSize(uint64_t alignment) {
+    return MTLHeap_property(handle, WMTHeapPropertyMaxAvailableSize, alignment);
   }
 };
 
@@ -289,6 +327,18 @@ public:
     MTLBuffer_updateContents(handle, offset, ptr, length);
   }
 };
+
+/* Out of line: Heap is declared before Buffer so that Buffer's own members can
+ * stay inline, but these need the complete types. */
+inline Reference<Buffer>
+Heap::newBuffer(WMTBufferInfo &info, uint64_t offset) {
+  return Reference<Buffer>(MTLHeap_newBuffer(handle, &info, offset));
+}
+
+inline Reference<Texture>
+Heap::newTexture(WMTTextureInfo &info, uint64_t offset) {
+  return Reference<Texture>(MTLHeap_newTexture(handle, &info, offset));
+}
 
 class SamplerState : public Object {
 public:
@@ -681,7 +731,15 @@ public:
   }
 };
 
-class Function : public Object {};
+class Function : public Object {
+public:
+  /* Returns how many attributes the function has; pass a null out to size the
+   * array first. */
+  uint32_t
+  vertexAttributes(WMTVertexAttributeInfo *out, uint32_t capacity) {
+    return MTLFunction_vertexAttributes(handle, out, capacity);
+  }
+};
 
 class Library : public Object {
 public:
@@ -748,6 +806,25 @@ public:
   Reference<Buffer>
   newBuffer(WMTBufferInfo &info) {
     return Reference<Buffer>(MTLDevice_newBuffer(handle, &info));
+  }
+
+  Reference<Heap>
+  newHeap(const WMTHeapInfo &info) {
+    return Reference<Heap>(MTLDevice_newHeap(handle, &info));
+  }
+
+  WMTSizeAndAlign
+  heapBufferSizeAndAlign(uint64_t length, WMTResourceOptions options) {
+    WMTSizeAndAlign ret;
+    MTLDevice_heapBufferSizeAndAlign(handle, length, options, &ret);
+    return ret;
+  }
+
+  WMTSizeAndAlign
+  heapTextureSizeAndAlign(const WMTTextureInfo &info) {
+    WMTSizeAndAlign ret;
+    MTLDevice_heapTextureSizeAndAlign(handle, &info, &ret);
+    return ret;
   }
 
   Reference<SamplerState>
@@ -1074,6 +1151,11 @@ InitializeRenderPipelineInfo(WMTRenderPipelineInfo &info) {
   info.binary_archives_for_lookup.set(nullptr);
   info.num_binary_archives_for_lookup = 0;
   info.fail_on_binary_archive_miss = false;
+  /* Null means the pipeline gets no vertex descriptor, which is what shaders
+   * that fetch their own vertices need — every caller except the D3D12 path.
+   * This function assigns field by field rather than zeroing the struct, so a
+   * new field left out here is read uninitialised on the unix side. */
+  info.vertex_descriptor.set(nullptr);
 }
 
 inline void

@@ -634,3 +634,52 @@ struct DXMTClearUintMetadata {
 [[kernel]] void tile_barrier(ushort2 pos [[thread_position_in_threadgroup]]) {
   // empty
 }
+
+/* --- DXMT HUD overlay ------------------------------------------------------
+ * Standalone HUD renderer (independent from Apple's Metal Performance HUD):
+ * pre-transformed NDC vertices built on the CPU, glyphs from an R8Unorm
+ * atlas, solid fills signalled by a negative u coordinate.
+ */
+
+struct dxmt_hud_vertex {
+  /* packed_float2 keeps the struct tightly packed at 20 bytes: a plain float2
+   * forces 8-byte struct alignment, so the array stride would become 24 and
+   * desync from the CPU-side 20-byte Vertex, feeding garbage NDC to the GPU. */
+  packed_float2 ndc;
+  packed_float2 uv; /* atlas pixel coords; uv.x < 0 -> solid fill */
+  uint color; /* ABGR packed (little-endian RGBA bytes) */
+};
+
+struct dxmt_hud_v2f {
+  float4 position [[position]];
+  float2 uv;
+  float4 color;
+};
+
+[[vertex]] dxmt_hud_v2f vs_hud(
+    uint id [[vertex_id]],
+    const device dxmt_hud_vertex *vertices [[buffer(0)]]
+) {
+  dxmt_hud_vertex v = vertices[id];
+  dxmt_hud_v2f out;
+  float2 ndc = v.ndc;
+  out.position = float4(ndc, 0.0, 1.0);
+  out.uv = v.uv;
+  out.color = float4(
+      float(v.color & 0xffu), float((v.color >> 8) & 0xffu),
+      float((v.color >> 16) & 0xffu), float((v.color >> 24) & 0xffu)
+  ) / 255.0;
+  return out;
+}
+
+[[fragment]] float4 fs_hud(
+    dxmt_hud_v2f in [[stage_in]],
+    texture2d<float> font [[texture(0)]]
+) {
+  float alpha = 1.0;
+  if (in.uv.x >= 0.0) {
+    constexpr sampler s(coord::pixel, filter::nearest);
+    alpha = font.sample(s, in.uv).r;
+  }
+  return float4(in.color.rgb * in.color.a * alpha, in.color.a * alpha);
+}

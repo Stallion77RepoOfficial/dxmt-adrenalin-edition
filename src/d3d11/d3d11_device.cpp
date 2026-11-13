@@ -22,9 +22,14 @@
 #include "ftl.hpp"
 #include "d3d11_resource.hpp"
 #include "dxgi_object.hpp"
+#include <algorithm>
+#include <cstring>
 #include <memory>
 #include "d3d11_4.h"
+#include "d3d11_on12.hpp"
 #include "util_win32_compat.h"
+#include <d3d11on12.h>
+#include <mutex>
 
 namespace dxmt {
 
@@ -40,6 +45,100 @@ const GUID kGpaUUID = {0xccffef16,
                        0x7b69,
                        0x468f,
                        {0xbc, 0xe3, 0xcd, 0x95, 0x33, 0x69, 0xa3, 0x9a}};
+
+/* A resource's usage fixes who may read and write it, and D3D11 refuses a
+ * description that contradicts it. Letting one through built resources no
+ * backend can hold: a dynamic depth-stencil texture became a linear Metal
+ * depth texture, which Metal does not have, and its validation aborts the
+ * process outright on arm64. */
+static bool
+ValidateResourceAccess(bool is_texture, D3D11_USAGE usage, UINT bind_flags, UINT cpu_access,
+                       D3D_FEATURE_LEVEL feature_level) {
+  constexpr UINT gpu_read_only = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER |
+                                 D3D11_BIND_CONSTANT_BUFFER | D3D11_BIND_SHADER_RESOURCE;
+  switch (usage) {
+  case D3D11_USAGE_DEFAULT:
+    /* Windows lets these through with CPU access as well. */
+    if ((bind_flags == D3D11_BIND_SHADER_RESOURCE && feature_level >= D3D_FEATURE_LEVEL_11_0) ||
+        (is_texture && bind_flags == D3D11_BIND_RENDER_TARGET) || bind_flags == D3D11_BIND_UNORDERED_ACCESS)
+      return true;
+    return !cpu_access;
+  case D3D11_USAGE_IMMUTABLE:
+    return bind_flags && !(bind_flags & ~gpu_read_only) && !cpu_access;
+  case D3D11_USAGE_DYNAMIC:
+    return bind_flags && !(bind_flags & ~gpu_read_only) && cpu_access == D3D11_CPU_ACCESS_WRITE;
+  case D3D11_USAGE_STAGING:
+    return !bind_flags && cpu_access;
+  default:
+    return false;
+  }
+}
+
+/* D3D10_SB_TOKENIZED_PROGRAM_TYPE: the stage a DXBC program is written for. */
+enum ShaderProgramType : uint32_t {
+  kPixelProgram = 0,
+  kVertexProgram = 1,
+  kGeometryProgram = 2,
+  kHullProgram = 3,
+  kDomainProgram = 4,
+  kComputeProgram = 5,
+};
+
+/* What a shader creation call is given has to be a program it can create: a
+ * DXBC container whose SHDR or SHEX chunk is written for one of the stages
+ * the call makes, in a model the feature level runs -- below 10.0 only the
+ * 4.0 programs that carry a level-9 (Aon9) translation. */
+static HRESULT
+ValidateShaderBytecode(const void *bytecode, SIZE_T length, std::initializer_list<uint32_t> types,
+                       D3D_FEATURE_LEVEL feature_level) {
+  auto bytes = static_cast<const uint8_t *>(bytecode);
+  auto dword = [&](size_t offset) {
+    uint32_t value;
+    memcpy(&value, bytes + offset, sizeof(value));
+    return value;
+  };
+  if (!bytes || length < 32 || memcmp(bytes, "DXBC", 4))
+    return E_INVALIDARG;
+  uint64_t chunk_count = dword(28);
+  if (32 + 4 * chunk_count > length)
+    return E_INVALIDARG;
+  const uint8_t *program = nullptr;
+  bool level9 = false;
+  for (uint64_t i = 0; i < chunk_count; i++) {
+    uint64_t offset = dword(32 + 4 * i);
+    if (offset + 8 > length || offset + 8 + dword(offset + 4) > length)
+      return E_INVALIDARG;
+    if (!memcmp(bytes + offset, "SHDR", 4) || !memcmp(bytes + offset, "SHEX", 4)) {
+      if (dword(offset + 4) < 8)
+        return E_INVALIDARG;
+      program = bytes + offset + 8;
+    } else if (!memcmp(bytes + offset, "Aon9", 4)) {
+      level9 = true;
+    }
+  }
+  if (!program)
+    return E_INVALIDARG;
+  uint32_t version;
+  memcpy(&version, program, sizeof(version));
+  uint32_t type = version >> 16, model = ((version >> 4) & 0xf) * 10 + (version & 0xf);
+  if (std::find(types.begin(), types.end(), type) == types.end())
+    return E_INVALIDARG;
+  if (feature_level < D3D_FEATURE_LEVEL_10_0)
+    return level9 && model == 40 ? S_OK : E_INVALIDARG;
+  if (model > (feature_level >= D3D_FEATURE_LEVEL_11_0 ? 50u : feature_level >= D3D_FEATURE_LEVEL_10_1 ? 41u : 40u))
+    return E_INVALIDARG;
+  return S_OK;
+}
+
+/* A resource whose mips are generated is drawn into and sampled: buffers have
+ * no mips, and a texture needs both bindings. */
+static bool
+ValidateGenerateMips(bool is_texture, UINT bind_flags, UINT misc_flags) {
+  if (!(misc_flags & D3D11_RESOURCE_MISC_GENERATE_MIPS))
+    return true;
+  constexpr UINT needed = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+  return is_texture && (bind_flags & needed) == needed;
+}
 
 class MTLD3D11DeviceImpl final : public MTLD3D11Device, public IMTLD3D11DeviceExt, public IMTLSwapChainFactory {
 friend class MTLD3D11DXGIDevice;
@@ -82,8 +181,26 @@ public:
                ID3D11Buffer **ppBuffer) override {
     InitReturnPtr(ppBuffer);
 
+    if (!pDesc)
+      return E_INVALIDARG;
     if (pDesc->ByteWidth == 0 && !(pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILE_POOL))
       return E_INVALIDARG; 
+
+    /* A constant buffer is addressed in float4 units, so its size has to be a
+     * whole number of them. D3D11 refuses anything else outright. */
+    if ((pDesc->BindFlags & D3D11_BIND_CONSTANT_BUFFER) && (pDesc->ByteWidth % 16))
+      return E_INVALIDARG;
+
+    /* Initial data means data. A D3D11_SUBRESOURCE_DATA whose pSysMem is null
+     * is refused, not read: the upload path copies ByteWidth bytes from it and
+     * a null source faulted inside the unix call, which came back as a failed
+     * unix call and took the process down. */
+    if (pInitialData && !pInitialData->pSysMem)
+      return E_INVALIDARG;
+
+    if (!ValidateResourceAccess(false, pDesc->Usage, pDesc->BindFlags, pDesc->CPUAccessFlags, feature_level_) ||
+        !ValidateGenerateMips(false, pDesc->BindFlags, pDesc->MiscFlags))
+      return E_INVALIDARG;
 
     try {
       switch (pDesc->Usage) {
@@ -114,6 +231,21 @@ public:
 
     if (pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILED)
       return E_INVALIDARG; // not supported yet
+
+    /* Initial data means data. A subresource whose pSysMem is null is refused
+     * rather than read -- the upload copies from it, and a null source faults
+     * inside the unix call, which surfaces as a failed unix call and takes the
+     * process down instead of failing the creation. */
+    if (pInitialData) {
+      unsigned subresources = pDesc->MipLevels ? pDesc->MipLevels * pDesc->ArraySize : 1;
+      for (unsigned i = 0; i < subresources; i++)
+        if (!pInitialData[i].pSysMem)
+          return E_INVALIDARG;
+    }
+
+    if (!ValidateResourceAccess(true, pDesc->Usage, pDesc->BindFlags, pDesc->CPUAccessFlags, feature_level_) ||
+        !ValidateGenerateMips(true, pDesc->BindFlags, pDesc->MiscFlags))
+      return E_INVALIDARG;
 
     try {
       switch (pDesc->Usage) {
@@ -239,6 +371,8 @@ public:
                      ID3D11ClassLinkage *pClassLinkage,
                      ID3D11VertexShader **ppVertexShader) override {
     InitReturnPtr(ppVertexShader);
+    if (HRESULT hr = ValidateShaderBytecode(pShaderBytecode, BytecodeLength, {kVertexProgram}, feature_level_); FAILED(hr))
+      return hr;
     if (pClassLinkage != nullptr)
       WARN("Class linkage not supported");
 
@@ -251,6 +385,8 @@ public:
                        ID3D11ClassLinkage *pClassLinkage,
                        ID3D11GeometryShader **ppGeometryShader) override {
     InitReturnPtr(ppGeometryShader);
+    if (HRESULT hr = ValidateShaderBytecode(pShaderBytecode, BytecodeLength, {kGeometryProgram}, feature_level_); FAILED(hr))
+      return hr;
     if (pClassLinkage != nullptr)
       WARN("Class linkage not supported");
 
@@ -268,6 +404,10 @@ public:
       ID3D11ClassLinkage *pClassLinkage,
       ID3D11GeometryShader **ppGeometryShader) override {
     InitReturnPtr(ppGeometryShader);
+    if (HRESULT hr = ValidateShaderBytecode(pShaderBytecode, BytecodeLength,
+                                            {kVertexProgram, kDomainProgram, kGeometryProgram}, feature_level_);
+        FAILED(hr))
+      return hr;
     if (pClassLinkage != nullptr)
       WARN("Class linkage not supported");
 
@@ -296,6 +436,8 @@ public:
                     ID3D11ClassLinkage *pClassLinkage,
                     ID3D11PixelShader **ppPixelShader) override {
     InitReturnPtr(ppPixelShader);
+    if (HRESULT hr = ValidateShaderBytecode(pShaderBytecode, BytecodeLength, {kPixelProgram}, feature_level_); FAILED(hr))
+      return hr;
     if (pClassLinkage != nullptr)
       WARN("Class linkage not supported");
 
@@ -308,6 +450,8 @@ public:
                    ID3D11ClassLinkage *pClassLinkage,
                    ID3D11HullShader **ppHullShader) override {
     InitReturnPtr(ppHullShader);
+    if (HRESULT hr = ValidateShaderBytecode(pShaderBytecode, BytecodeLength, {kHullProgram}, feature_level_); FAILED(hr))
+      return hr;
     if (pClassLinkage != nullptr)
       WARN("Class linkage not supported");
 
@@ -323,6 +467,8 @@ public:
                      ID3D11ClassLinkage *pClassLinkage,
                      ID3D11DomainShader **ppDomainShader) override {
     InitReturnPtr(ppDomainShader);
+    if (HRESULT hr = ValidateShaderBytecode(pShaderBytecode, BytecodeLength, {kDomainProgram}, feature_level_); FAILED(hr))
+      return hr;
     if (pClassLinkage != nullptr)
       WARN("Class linkage not supported");
 
@@ -338,6 +484,8 @@ public:
                       ID3D11ClassLinkage *pClassLinkage,
                       ID3D11ComputeShader **ppComputeShader) override {
     InitReturnPtr(ppComputeShader);
+    if (HRESULT hr = ValidateShaderBytecode(pShaderBytecode, BytecodeLength, {kComputeProgram}, feature_level_); FAILED(hr))
+      return hr;
     if (pClassLinkage != nullptr)
       WARN("Class linkage not supported");
 
@@ -354,7 +502,10 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreateBlendState(const D3D11_BLEND_DESC *pBlendStateDesc,
                    ID3D11BlendState **ppBlendState) override {
-    ID3D11BlendState1 *pBlendState1;
+    InitReturnPtr(ppBlendState);
+    if (!pBlendStateDesc)
+      return E_INVALIDARG;
+    ID3D11BlendState1 *pBlendState1 = nullptr;
     D3D11_BLEND_DESC1 desc;
     desc.AlphaToCoverageEnable = pBlendStateDesc->AlphaToCoverageEnable;
     desc.IndependentBlendEnable = pBlendStateDesc->IndependentBlendEnable;
@@ -377,8 +528,10 @@ public:
       desc.RenderTarget[i].RenderTargetWriteMask =
           pBlendStateDesc->RenderTarget[i].RenderTargetWriteMask;
     }
-    auto hr = CreateBlendState1(&desc, &pBlendState1);
-    *ppBlendState = pBlendState1;
+    /* No output pointer only validates the description. */
+    auto hr = CreateBlendState1(&desc, ppBlendState ? &pBlendState1 : nullptr);
+    if (ppBlendState)
+      *ppBlendState = pBlendState1;
     return hr;
   }
 
@@ -392,7 +545,10 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreateRasterizerState(const D3D11_RASTERIZER_DESC *pRasterizerDesc,
                         ID3D11RasterizerState **ppRasterizerState) override {
-    ID3D11RasterizerState2 *pRasterizerState;
+    InitReturnPtr(ppRasterizerState);
+    if (!pRasterizerDesc)
+      return E_INVALIDARG;
+    ID3D11RasterizerState2 *pRasterizerState = nullptr;
     D3D11_RASTERIZER_DESC2 desc;
     desc.FillMode = pRasterizerDesc->FillMode;
     desc.CullMode = pRasterizerDesc->CullMode;
@@ -406,8 +562,9 @@ public:
     desc.AntialiasedLineEnable = pRasterizerDesc->AntialiasedLineEnable;
     desc.ForcedSampleCount = 0;
     desc.ConservativeRaster = D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF;
-    auto hr = CreateRasterizerState2(&desc, &pRasterizerState);
-    *ppRasterizerState = pRasterizerState;
+    auto hr = CreateRasterizerState2(&desc, ppRasterizerState ? &pRasterizerState : nullptr);
+    if (ppRasterizerState)
+      *ppRasterizerState = pRasterizerState;
     return hr;
   }
 
@@ -420,6 +577,10 @@ public:
 
   HRESULT STDMETHODCALLTYPE
   CreateQuery(const D3D11_QUERY_DESC *pQueryDesc, ID3D11Query **ppQuery) override {
+    if (!pQueryDesc) {
+      InitReturnPtr(ppQuery);
+      return E_INVALIDARG;
+    }
     D3D11_QUERY_DESC1 desc;
     desc.Query = pQueryDesc->Query;
     desc.MiscFlags = pQueryDesc->MiscFlags;
@@ -430,6 +591,13 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreatePredicate(const D3D11_QUERY_DESC *pPredicateDesc,
                   ID3D11Predicate **ppPredicate) override {
+    /* Only the two whole-pipeline yes-or-no queries are made this way; the
+     * per-stream overflow predicates come from CreateQuery. */
+    if (pPredicateDesc && pPredicateDesc->Query != D3D11_QUERY_OCCLUSION_PREDICATE &&
+        pPredicateDesc->Query != D3D11_QUERY_SO_OVERFLOW_PREDICATE) {
+      InitReturnPtr(ppPredicate);
+      return E_INVALIDARG;
+    }
     return CreateQuery(pPredicateDesc,
                        reinterpret_cast<ID3D11Query **>(ppPredicate));
   }
@@ -458,21 +626,28 @@ public:
 
   HRESULT STDMETHODCALLTYPE
       CheckFormatSupport(DXGI_FORMAT Format, UINT *pFormatSupport) override {
+    UINT support = FormatSupport(Format);
+    /* What the feature level does not have, no format has: no buffers or
+     * comparison sampling below 10.0, no gathers below 10.1. */
+    if (feature_level_ < D3D_FEATURE_LEVEL_10_0)
+      support &= ~(D3D11_FORMAT_SUPPORT_BUFFER | D3D11_FORMAT_SUPPORT_SHADER_SAMPLE_COMPARISON);
+    if (feature_level_ < D3D_FEATURE_LEVEL_10_1)
+      support &= ~(D3D11_FORMAT_SUPPORT_SHADER_GATHER | D3D11_FORMAT_SUPPORT_SHADER_GATHER_COMPARISON);
+    if (pFormatSupport)
+      *pFormatSupport = support;
+    /* A format with nothing to offer is not supported: E_FAIL, as D3D11 has
+     * it, for an unknown format as much as for one Metal cannot hold. */
+    return support ? S_OK : E_FAIL;
+  }
 
-    if (pFormatSupport) {
-      *pFormatSupport = 0;
-    }
-
-    if (Format == DXGI_FORMAT_UNKNOWN) {
-      *pFormatSupport =
-          D3D11_FORMAT_SUPPORT_BUFFER | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
-      return S_OK;
-    }
+  UINT
+  FormatSupport(DXGI_FORMAT Format) {
+    if (Format == DXGI_FORMAT_UNKNOWN)
+      return D3D11_FORMAT_SUPPORT_BUFFER | D3D11_FORMAT_SUPPORT_CPU_LOCKABLE;
 
     MTL_DXGI_FORMAT_DESC metal_format;
-    if (FAILED(MTLQueryDXGIFormat(GetMTLDevice(), Format, metal_format))) {
-      return E_INVALIDARG;
-    }
+    if (FAILED(MTLQueryDXGIFormat(GetMTLDevice(), Format, metal_format)))
+      return 0;
 
     UINT outFormatSupport = 0;
 
@@ -489,7 +664,12 @@ public:
                           D3D11_FORMAT_SUPPORT_CAST_WITHIN_BIT_LAYOUT;
 
       if (!(metal_format.Flag & (MTL_DXGI_FORMAT_BC | MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER))) {
-        outFormatSupport |= D3D11_FORMAT_SUPPORT_BUFFER | D3D11_FORMAT_SUPPORT_MIP_AUTOGEN;
+        outFormatSupport |= D3D11_FORMAT_SUPPORT_BUFFER;
+        /* Generating mips filters one level into the next: integer formats,
+         * which cannot be filtered, have none generated. */
+        auto capability = GetMTLPixelFormatCapability(metal_format.PixelFormat);
+        if (any_bit_set(capability & FormatCapability::Filter) && any_bit_set(capability & FormatCapability::Color))
+          outFormatSupport |= D3D11_FORMAT_SUPPORT_MIP_AUTOGEN;
       }
 
       if (metal_format.Flag & MTL_DXGI_FORMAT_BACKBUFFER) {
@@ -546,11 +726,7 @@ public:
         Format == DXGI_FORMAT_R32G32B32A32_SINT)
       outFormatSupport |= D3D11_FORMAT_SUPPORT_SO_BUFFER;
 
-    if (pFormatSupport) {
-      *pFormatSupport = outFormatSupport;
-    }
-
-    return S_OK;
+    return outFormatSupport;
   }
 
   HRESULT STDMETHODCALLTYPE CheckMultisampleQualityLevels(
@@ -690,7 +866,11 @@ public:
   UINT STDMETHODCALLTYPE GetCreationFlags() override { return feature_flags_ & 0x7fffffff; }
 
   HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override {
-    // unless we are deal with eGPU, this method should awalys return S_OK?
+    // The physical device can't be removed (unless we deal with an eGPU), but
+    // the command queue stops waiting on the GPU once it detects a hang, which
+    // is the moral equivalent of a TDR-triggered removal.
+    if (device_.queue().IsDeviceWedged())
+      return DXGI_ERROR_DEVICE_HUNG;
     return S_OK;
   }
 
@@ -733,7 +913,10 @@ public:
   HRESULT STDMETHODCALLTYPE
   CreateRasterizerState1(const D3D11_RASTERIZER_DESC1 *pRasterizerDesc,
                          ID3D11RasterizerState1 **ppRasterizerState) override {
-    ID3D11RasterizerState2 *pRasterizerState;
+    InitReturnPtr(ppRasterizerState);
+    if (!pRasterizerDesc)
+      return E_INVALIDARG;
+    ID3D11RasterizerState2 *pRasterizerState = nullptr;
     D3D11_RASTERIZER_DESC2 desc;
     desc.FillMode = pRasterizerDesc->FillMode;
     desc.CullMode = pRasterizerDesc->CullMode;
@@ -747,8 +930,9 @@ public:
     desc.AntialiasedLineEnable = pRasterizerDesc->AntialiasedLineEnable;
     desc.ForcedSampleCount = pRasterizerDesc->ForcedSampleCount;
     desc.ConservativeRaster = D3D11_CONSERVATIVE_RASTERIZATION_MODE_OFF;
-    auto hr = CreateRasterizerState2(&desc, &pRasterizerState);
-    *ppRasterizerState = pRasterizerState;
+    auto hr = CreateRasterizerState2(&desc, ppRasterizerState ? &pRasterizerState : nullptr);
+    if (ppRasterizerState)
+      *ppRasterizerState = pRasterizerState;
     return hr;
   }
 
@@ -758,8 +942,21 @@ public:
       D3D_FEATURE_LEVEL *pChosenFeatureLevel,
       ID3DDeviceContextState **ppContextState) override {
     InitReturnPtr(ppContextState);
+    if (pChosenFeatureLevel)
+      *pChosenFeatureLevel = (D3D_FEATURE_LEVEL)0;
+    if (!pFeatureLevels || !FeatureLevels)
+      return E_INVALIDARG;
 
-    // TODO: validation
+    /* The first level asked for that this device reaches. */
+    D3D_FEATURE_LEVEL chosen = (D3D_FEATURE_LEVEL)0;
+    for (UINT i = 0; i < FeatureLevels && !chosen; i++) {
+      if (pFeatureLevels[i] <= GetFeatureLevel())
+        chosen = pFeatureLevels[i];
+    }
+    if (!chosen)
+      return E_INVALIDARG;
+    if (pChosenFeatureLevel)
+      *pChosenFeatureLevel = chosen;
 
     if (ppContextState == nullptr) {
       return S_FALSE;
@@ -797,21 +994,46 @@ public:
       D3D11_PACKED_MIP_DESC *mip_desc, D3D11_TILE_SHAPE *tile_shape,
       UINT *subresource_tiling_count, UINT first_subresource_tiling,
       D3D11_SUBRESOURCE_TILING *subresource_tiling) override{
-    UNIMPLEMENTED("tiled resource: get resource tiling");
+    /* No resource is tiled: every resource has no tiles. */
+    if (tile_count)
+      *tile_count = 0;
+    if (mip_desc)
+      *mip_desc = {};
+    if (tile_shape)
+      *tile_shape = {};
+    if (subresource_tiling_count)
+      *subresource_tiling_count = 0;
   }
 
   HRESULT STDMETHODCALLTYPE
   CheckMultisampleQualityLevels1(DXGI_FORMAT Format, UINT SampleCount, UINT Flags, UINT *pNumQualityLevels) override {
+    if (!pNumQualityLevels)
+      return E_INVALIDARG;
     if (Flags) {
       ERR("CheckMultisampleQualityLevels1: unsupported flags ", Flags);
       return E_INVALIDARG;
     }
-    *pNumQualityLevels = 0;
-    MTL_DXGI_FORMAT_DESC desc;
-    if (FAILED(MTLQueryDXGIFormat(GetMTLDevice(), Format, desc)) ||
-        desc.PixelFormat == WMTPixelFormatInvalid) {
+    /* An unknown format has no levels; one that is not a format at all is
+     * refused before anything is written. */
+    MTL_DXGI_FORMAT_DESC desc = {};
+    if (Format != DXGI_FORMAT_UNKNOWN &&
+        (FAILED(MTLQueryDXGIFormat(GetMTLDevice(), Format, desc)) || desc.PixelFormat == WMTPixelFormatInvalid)) {
       return E_INVALIDARG;
     }
+    *pNumQualityLevels = 0;
+    if (!SampleCount || SampleCount > D3D11_MAX_MULTISAMPLE_SAMPLE_COUNT)
+      return E_FAIL;
+    if (Format == DXGI_FORMAT_UNKNOWN)
+      return S_OK;
+    if (SampleCount == 1) {
+      *pNumQualityLevels = 1;
+      return S_OK;
+    }
+    /* A format that cannot be a multisampled render target -- block
+     * compressed ones, for a start -- has no levels at any count. */
+    if (!any_bit_set(GetMTLPixelFormatCapability(desc.PixelFormat) & FormatCapability::MSAA) &&
+        !(desc.Flag & (MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_TYPELESS)))
+      return S_OK;
 
     // MSDN:
     // FEATURE_LEVEL_11_0 devices are required to support 4x MSAA for all render
@@ -839,6 +1061,21 @@ public:
 
     if ((pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILED))
       return E_INVALIDARG; // not supported yet
+
+    /* Initial data means data. A subresource whose pSysMem is null is refused
+     * rather than read -- the upload copies from it, and a null source faults
+     * inside the unix call, which surfaces as a failed unix call and takes the
+     * process down instead of failing the creation. */
+    if (pInitialData) {
+      unsigned subresources = pDesc->MipLevels ? pDesc->MipLevels * pDesc->ArraySize : 1;
+      for (unsigned i = 0; i < subresources; i++)
+        if (!pInitialData[i].pSysMem)
+          return E_INVALIDARG;
+    }
+
+    if (!ValidateResourceAccess(true, pDesc->Usage, pDesc->BindFlags, pDesc->CPUAccessFlags, feature_level_) ||
+        !ValidateGenerateMips(true, pDesc->BindFlags, pDesc->MiscFlags))
+      return E_INVALIDARG;
 
     try {
       switch (pDesc->Usage) {
@@ -875,6 +1112,21 @@ public:
 
     if ((pDesc->MiscFlags & D3D11_RESOURCE_MISC_TILED))
       return E_INVALIDARG; // not supported yet
+
+    /* Initial data means data. A subresource whose pSysMem is null is refused
+     * rather than read -- the upload copies from it, and a null source faults
+     * inside the unix call, which surfaces as a failed unix call and takes the
+     * process down instead of failing the creation. */
+    if (pInitialData) {
+      unsigned subresources = pDesc->MipLevels ? pDesc->MipLevels : 1;
+      for (unsigned i = 0; i < subresources; i++)
+        if (!pInitialData[i].pSysMem)
+          return E_INVALIDARG;
+    }
+
+    if (!ValidateResourceAccess(true, pDesc->Usage, pDesc->BindFlags, pDesc->CPUAccessFlags, feature_level_) ||
+        !ValidateGenerateMips(true, pDesc->BindFlags, pDesc->MiscFlags))
+      return E_INVALIDARG;
 
     try {
       switch (pDesc->Usage) {
@@ -972,6 +1224,27 @@ public:
       *ppQuery = ref(new MTLD3D11DummyQuery<D3D11_QUERY_DATA_PIPELINE_STATISTICS>(this, pQueryDesc));
       return S_OK;
     }
+    /* Stream-output counters have no Metal equivalent to read, so these
+     * report zero written and nothing overflowed. Refusing to create them
+     * instead would be worse: an application that uses stream output at all
+     * creates these at startup and treats the failure as no stream output,
+     * losing the feature entirely over a statistic it mostly logs. */
+    case D3D11_QUERY_SO_STATISTICS:
+    case D3D11_QUERY_SO_STATISTICS_STREAM0:
+    case D3D11_QUERY_SO_STATISTICS_STREAM1:
+    case D3D11_QUERY_SO_STATISTICS_STREAM2:
+    case D3D11_QUERY_SO_STATISTICS_STREAM3: {
+      *ppQuery = ref(new MTLD3D11DummyQuery<D3D11_QUERY_DATA_SO_STATISTICS>(this, pQueryDesc));
+      return S_OK;
+    }
+    case D3D11_QUERY_SO_OVERFLOW_PREDICATE:
+    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM0:
+    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM1:
+    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM2:
+    case D3D11_QUERY_SO_OVERFLOW_PREDICATE_STREAM3: {
+      *ppQuery = ref(new MTLD3D11DummyQuery<BOOL>(this, pQueryDesc));
+      return S_OK;
+    }
     default:
       ERR("CreateQuery1: query type not implemented: ", pQueryDesc->Query);
       return E_NOTIMPL;
@@ -989,12 +1262,18 @@ public:
     return S_OK;
   }
 
+  /* The CPU side of a mapped default resource. Nothing reports map-on-default
+   * yet, but a caller that uses these anyway gets what a mapped resource
+   * would give it: the write lands as UpdateSubresource lands it, and the read
+   * comes through a staging copy of the subresource. */
   void STDMETHODCALLTYPE
   WriteToSubresource(
       ID3D11Resource *pDstResource, UINT DstSubresource, const D3D11_BOX *pDstBox, const void *pSrcData,
       UINT SrcRowPitch, UINT SrcDepthPitch
   ) override {
-    UNIMPLEMENTED("map-on-default: write resource");
+    if (!pDstResource || !pSrcData)
+      return;
+    context_->UpdateSubresource(pDstResource, DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch);
   }
 
   void STDMETHODCALLTYPE
@@ -1002,7 +1281,102 @@ public:
       void *pDstData, UINT DstRowPitch, UINT DstDepthPitch, ID3D11Resource *SrcResource, UINT SrcSubresource,
       const D3D11_BOX *pSrcBox
   ) override {
-    UNIMPLEMENTED("map-on-default: read resource");
+    if (!pDstData || !SrcResource)
+      return;
+    D3D11_RESOURCE_DIMENSION dimension;
+    SrcResource->GetType(&dimension);
+    Com<ID3D11Resource> staging;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    UINT width = 1, height = 1, depth = 1, mip = 0;
+    switch (dimension) {
+    case D3D11_RESOURCE_DIMENSION_BUFFER: {
+      D3D11_BUFFER_DESC desc;
+      static_cast<ID3D11Buffer *>(SrcResource)->GetDesc(&desc);
+      width = desc.ByteWidth;
+      desc.Usage = D3D11_USAGE_STAGING;
+      desc.BindFlags = 0;
+      desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      desc.MiscFlags = 0;
+      desc.StructureByteStride = 0;
+      if (FAILED(CreateBuffer(&desc, nullptr, reinterpret_cast<ID3D11Buffer **>(&staging))))
+        return;
+      break;
+    }
+    case D3D11_RESOURCE_DIMENSION_TEXTURE1D: {
+      D3D11_TEXTURE1D_DESC desc;
+      static_cast<ID3D11Texture1D *>(SrcResource)->GetDesc(&desc);
+      mip = SrcSubresource % desc.MipLevels;
+      format = desc.Format;
+      width = std::max(1u, desc.Width >> mip);
+      desc.Usage = D3D11_USAGE_STAGING;
+      desc.BindFlags = 0;
+      desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      desc.MiscFlags = 0;
+      if (FAILED(CreateTexture1D(&desc, nullptr, reinterpret_cast<ID3D11Texture1D **>(&staging))))
+        return;
+      break;
+    }
+    case D3D11_RESOURCE_DIMENSION_TEXTURE2D: {
+      D3D11_TEXTURE2D_DESC desc;
+      static_cast<ID3D11Texture2D *>(SrcResource)->GetDesc(&desc);
+      mip = SrcSubresource % desc.MipLevels;
+      format = desc.Format;
+      width = std::max(1u, desc.Width >> mip);
+      height = std::max(1u, desc.Height >> mip);
+      desc.Usage = D3D11_USAGE_STAGING;
+      desc.BindFlags = 0;
+      desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      desc.MiscFlags = 0;
+      if (FAILED(CreateTexture2D(&desc, nullptr, reinterpret_cast<ID3D11Texture2D **>(&staging))))
+        return;
+      break;
+    }
+    case D3D11_RESOURCE_DIMENSION_TEXTURE3D: {
+      D3D11_TEXTURE3D_DESC desc;
+      static_cast<ID3D11Texture3D *>(SrcResource)->GetDesc(&desc);
+      mip = SrcSubresource;
+      format = desc.Format;
+      width = std::max(1u, desc.Width >> mip);
+      height = std::max(1u, desc.Height >> mip);
+      depth = std::max(1u, desc.Depth >> mip);
+      desc.Usage = D3D11_USAGE_STAGING;
+      desc.BindFlags = 0;
+      desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+      desc.MiscFlags = 0;
+      if (FAILED(CreateTexture3D(&desc, nullptr, reinterpret_cast<ID3D11Texture3D **>(&staging))))
+        return;
+      break;
+    }
+    default:
+      return;
+    }
+    D3D11_BOX box = pSrcBox ? *pSrcBox : D3D11_BOX{0, 0, 0, width, height, depth};
+    if (box.left >= box.right || box.top >= box.bottom || box.front >= box.back)
+      return;
+    context_->CopySubresourceRegion(staging.ptr(), SrcSubresource, box.left, box.top, box.front, SrcResource,
+                                    SrcSubresource, &box);
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (FAILED(context_->Map(staging.ptr(), SrcSubresource, D3D11_MAP_READ, 0, &mapped)))
+      return;
+    if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+      memcpy(pDstData, static_cast<const char *>(mapped.pData) + box.left, box.right - box.left);
+    } else {
+      MTL_DXGI_FORMAT_DESC metal_format;
+      if (SUCCEEDED(MTLQueryDXGIFormat(GetMTLDevice(), format, metal_format)) && metal_format.BytesPerTexel) {
+        /* Compressed formats are laid out in rows of 4x4 blocks. */
+        bool bc = metal_format.Flag & MTL_DXGI_FORMAT_BC;
+        UINT x = bc ? box.left >> 2 : box.left, y = bc ? box.top >> 2 : box.top;
+        UINT row_bytes = (bc ? (align(box.right - box.left, 4u) >> 2) : box.right - box.left) * metal_format.BytesPerTexel;
+        UINT rows = bc ? align(box.bottom - box.top, 4u) >> 2 : box.bottom - box.top;
+        for (UINT z = 0; z < box.back - box.front; z++)
+          for (UINT row = 0; row < rows; row++)
+            memcpy(static_cast<char *>(pDstData) + z * DstDepthPitch + row * DstRowPitch,
+                   static_cast<const char *>(mapped.pData) + (box.front + z) * mapped.DepthPitch +
+                       (y + row) * mapped.RowPitch + x * metal_format.BytesPerTexel,
+                   row_bytes);
+      }
+    }
+    context_->Unmap(staging.ptr(), SrcSubresource);
   }
 
   WMT::Device STDMETHODCALLTYPE GetMTLDevice() override {
@@ -1098,7 +1472,24 @@ public:
     return dxmt::CreateSwapChain(pFactory, this, hWnd, pDesc, pFullscreenDesc, ppSwapChain);
   }
 
+  void SetD3D12Device(IUnknown *pDevice) final {
+    std::lock_guard lock(d3d12_device_mutex_);
+    d3d12_device_ = pDevice;
+  }
+
+  bool HasD3D12Device() {
+    std::lock_guard lock(d3d12_device_mutex_);
+    return d3d12_device_ != nullptr;
+  }
+
+  HRESULT QueryD3D12Device(REFIID riid, void **ppDevice) {
+    std::lock_guard lock(d3d12_device_mutex_);
+    return d3d12_device_ ? d3d12_device_->QueryInterface(riid, ppDevice) : DXGI_ERROR_DEVICE_REMOVED;
+  }
+
 private:
+  std::mutex d3d12_device_mutex_;
+  IUnknown *d3d12_device_ = nullptr;
   MTLDXGIObject<IMTLDXGIDevice> *container_;
   D3D_FEATURE_LEVEL feature_level_;
   UINT feature_flags_;
@@ -1121,6 +1512,57 @@ private:
   D3D11Multithread d3dmt_;
 };
 
+/* ID3D11On12Device of a device that DXMT's D3D12 records through. Both APIs
+ * encode into this device's one command stream in call order, so a wrapped
+ * resource is the d3d11 resource behind the D3D12 one, and acquiring or
+ * releasing it orders nothing that is not ordered already. */
+class MTLD3D11On12Device final : public ID3D11On12Device1 {
+public:
+  MTLD3D11On12Device(MTLDXGIObject<IMTLDXGIDevice> *container, MTLD3D11DeviceImpl *device)
+      : container_(container), device_(device) {}
+
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) final {
+    return container_->QueryInterface(riid, ppvObject);
+  }
+
+  ULONG STDMETHODCALLTYPE AddRef() final { return container_->AddRef(); }
+
+  ULONG STDMETHODCALLTYPE Release() final { return container_->Release(); }
+
+  HRESULT STDMETHODCALLTYPE
+  CreateWrappedResource(IUnknown *pResource12, const D3D11_RESOURCE_FLAGS *pFlags11, D3D12_RESOURCE_STATES InState,
+                        D3D12_RESOURCE_STATES OutState, REFIID riid, void **ppResource11) final {
+    InitReturnPtr(ppResource11);
+    if (!pResource12 || !ppResource11)
+      return E_INVALIDARG;
+    Com<IMTLD3D12ResourceInterop> interop;
+    if (FAILED(pResource12->QueryInterface(IID_PPV_ARGS(&interop))))
+      return E_INVALIDARG;
+    Com<ID3D11Resource> resource;
+    HRESULT hr = interop->GetD3D11Resource(&resource);
+    if (FAILED(hr)) {
+      ERR("D3D11On12: this D3D12 resource has no d3d11 resource behind it");
+      return hr;
+    }
+    return resource->QueryInterface(riid, ppResource11);
+  }
+
+  void STDMETHODCALLTYPE ReleaseWrappedResources(ID3D11Resource *const *ppResources, UINT NumResources) final {}
+
+  void STDMETHODCALLTYPE AcquireWrappedResources(ID3D11Resource *const *ppResources, UINT NumResources) final {}
+
+  HRESULT STDMETHODCALLTYPE GetD3D12Device(REFIID riid, ID3D12Device **ppDevice) final {
+    InitReturnPtr(ppDevice);
+    if (!ppDevice)
+      return E_INVALIDARG;
+    return device_->QueryD3D12Device(riid, reinterpret_cast<void **>(ppDevice));
+  }
+
+private:
+  MTLDXGIObject<IMTLDXGIDevice> *container_;
+  MTLD3D11DeviceImpl *device_;
+};
+
 /**
  * \brief D3D11 device container
  *
@@ -1136,7 +1578,8 @@ public:
       : adapter_(adapter), device(std::move(device)),
         cmd_queue_(this->device->queue()),
         d3d11_device_(this, adapter, feature_level, feature_flags,
-                      *this->device.get()) {
+                      *this->device.get()),
+        d3d11on12_(this, &d3d11_device_) {
     if (adapter_->GetLocalD3DKMT()) {
       D3DKMT_CREATEDEVICE create = {};
       create.hAdapter = adapter_->GetLocalD3DKMT();
@@ -1198,6 +1641,13 @@ public:
       return S_OK;
     }
 
+    if (riid == __uuidof(ID3D11On12Device) || riid == __uuidof(ID3D11On12Device1)) {
+      if (!d3d11_device_.HasD3D12Device())
+        return E_NOINTERFACE;
+      *ppvObject = ref_and_cast<ID3D11On12Device1>(&d3d11on12_);
+      return S_OK;
+    }
+
     if (riid == __uuidof(ID3D11Debug))
       return E_NOINTERFACE;
 
@@ -1227,7 +1677,39 @@ public:
   CreateSurface(const DXGI_SURFACE_DESC *desc, UINT surface_count,
                 DXGI_USAGE usage, const DXGI_SHARED_RESOURCE *shared_resource,
                 IDXGISurface **surface) override{
-    UNIMPLEMENTED("CreateSurface");
+    /* A DXGI surface of this device is a single-level 2D texture, bound as
+     * the usage asks. */
+    if (!desc || !surface_count || !surface)
+      return E_INVALIDARG;
+    if (shared_resource) {
+      ERR_ONCE("CreateSurface: shared surfaces are created unshared");
+    }
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = desc->Width;
+    td.Height = desc->Height;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = desc->Format;
+    td.SampleDesc = desc->SampleDesc;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    if (usage & DXGI_USAGE_RENDER_TARGET_OUTPUT)
+      td.BindFlags |= D3D11_BIND_RENDER_TARGET;
+    if (usage & DXGI_USAGE_SHADER_INPUT)
+      td.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+    if (usage & DXGI_USAGE_UNORDERED_ACCESS)
+      td.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+    for (UINT i = 0; i < surface_count; i++) {
+      Com<ID3D11Texture2D> texture;
+      HRESULT hr = d3d11_device_.CreateTexture2D(&td, nullptr, &texture);
+      if (SUCCEEDED(hr))
+        hr = texture->QueryInterface(IID_PPV_ARGS(&surface[i]));
+      if (FAILED(hr)) {
+        while (i)
+          surface[--i]->Release();
+        return hr;
+      }
+    }
+    return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -1307,6 +1789,7 @@ private:
   std::unique_ptr<Device> device;
   CommandQueue &cmd_queue_;
   MTLD3D11DeviceImpl d3d11_device_;
+  MTLD3D11On12Device d3d11on12_;
 };
 
 Com<IMTLDXGIDevice> CreateD3D11Device(std::unique_ptr<Device> &&device,

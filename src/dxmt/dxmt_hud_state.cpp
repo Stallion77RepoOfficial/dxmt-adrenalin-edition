@@ -1,6 +1,7 @@
 #include "dxmt_hud_state.hpp"
-#include "Metal.hpp"
+#include "dxmt_hud_renderer.hpp"
 #include "util_env.hpp"
+#include "log/log.hpp"
 #include <string>
 
 namespace dxmt {
@@ -61,54 +62,50 @@ parseHudElements(const std::string &config) {
 
 void
 HUDState::initialize(const std::string &heading) {
-  std::string dxmt_hud = env::getEnvVar("DXMT_HUD");
-  std::string metal_hud = env::getEnvVar("MTLHUDEnabled");
-  elements_ = parseHudElements(dxmt_hud);
-  enabled_ = elements_ != 0 || (!metal_hud.empty() && metal_hud != "0");
+  elements_ = parseHudElements(env::getEnvVar("DXMT_HUD"));
+  enabled_ = elements_ != 0;
+  heading_ = heading;
   if (!enabled_)
     return;
 
-  using namespace WMT;
-  auto pool = MakeAutoreleasePool();
-  auto str_dxmt_version = MakeString("com.github.3shain.dxmt-version", WMTUTF8StringEncoding);
-  hud_.addLabel(str_dxmt_version, String::string("com.apple.hud-graph.default", WMTUTF8StringEncoding));
-  hud_.updateLabel(str_dxmt_version, String::string(heading.c_str(), WMTUTF8StringEncoding));
-  line_labels_.push_back(std::move(str_dxmt_version));
+  auto &contents = GetHudContents();
+  std::lock_guard<std::mutex> lock(contents.mutex);
+  contents.active = true;
+  if (elements_ & static_cast<uint32_t>(HudElement::Version))
+    contents.heading = heading_;
 }
 
 void
 HUDState::begin() {
   if (!enabled_)
     return;
-  pool_ = WMT::MakeAutoreleasePool();
-  current_line_ = 1;
+  staging_lines_.clear();
 }
 
 void
 HUDState::printLine(const char *c_str) {
   if (!enabled_)
     return;
-  using namespace WMT;
-  while (current_line_ >= line_labels_.size()) {
-    String prev = line_labels_.back();
-    line_labels_.push_back(MakeString(
-        ("com.github.3shain.dxmt-line" + std::to_string(line_labels_.size())).c_str(), WMTUTF8StringEncoding
-    ));
-    hud_.addLabel(line_labels_.back(), prev);
-  }
-  hud_.updateLabel(line_labels_[current_line_], String::string(c_str, WMTUTF8StringEncoding));
-  current_line_++;
+  staging_lines_.emplace_back(c_str);
 }
 
 void
 HUDState::end() {
   if (!enabled_)
     return;
-  while (line_labels_.size() > current_line_) {
-    hud_.remove(line_labels_.back());
-    line_labels_.pop_back();
+  /* The HUD is on screen, which is no use when the run is being read back from
+   * a log -- a game on another machine, or a session with no eyes on it.
+   * DXMT_HUD_LOG=1 mirrors the same lines into the module log. */
+  static const bool mirror_to_log = env::getEnvVar("DXMT_HUD_LOG") == "1";
+  if (mirror_to_log) {
+    for (auto &line : staging_lines_)
+      Logger::info(line);
   }
-  pool_ = nullptr;
+  auto &contents = GetHudContents();
+  std::lock_guard<std::mutex> lock(contents.mutex);
+  if (elements_ & static_cast<uint32_t>(HudElement::Version))
+    contents.heading = heading_;
+  contents.lines = staging_lines_;
 }
 
 } // namespace dxmt

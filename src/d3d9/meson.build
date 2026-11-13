@@ -7,6 +7,18 @@ d3d9_src = [
   'd3d9_surface.cpp',
   'd3d9_buffer.cpp',
   'd3d9_texture.cpp',
+  'd3d9_volume.cpp',
+  'd3d9_shader.cpp',
+  'd3d9_vertex_declaration.cpp',
+  'd3d9_vertex_processing.cpp',
+  'd3d9_ffp.cpp',
+  'd3d9_query.cpp',
+  'd3d9_private_data.cpp',
+  'd3d9_stateblock.cpp',
+  'd3d9_swapchain.cpp',
+  'sm4/sm4_builder.cpp',
+  'sm3/sm3_decoder.cpp',
+  'sm3/sm3_translate.cpp',
 ]
 
 d3d9_ld_args      = ['-L' + windows_native_install_dir]
@@ -14,8 +26,8 @@ d3d9_link_depends = []
 
 d3d9_dll = shared_library('d3d9', d3d9_src, d3d9_res,
   name_prefix         : '',
-  dependencies        : [ d3d11_dep, dxgi_dep, dxmt_dep, winemetal_dep, util_dep ],
-  include_directories : [ dxmt_include_path ],
+  dependencies        : [ d3d11_dep, dxgi_dep, dxmt_dep, winemetal_dep, util_dep, dxbc_parser_dep, airconv_forward_dep ],
+  include_directories : [ dxmt_include_path, include_directories('sm4', 'sm3') ],
   install             : true,
   install_dir         : windows_native_install_dir,
   vs_module_defs      : 'd3d9.def',

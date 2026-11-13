@@ -95,7 +95,7 @@ template <> struct redundant_binding_trait<VERTEX_BUFFER_B> {
 
 struct D3D11InputAssemblerStageState {
   Com<IMTLD3D11InputLayout> InputLayout;
-  BindingSet<VERTEX_BUFFER_B, 16> VertexBuffers;
+  BindingSet<VERTEX_BUFFER_B, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> VertexBuffers;
   Com<D3D11ResourceCommon, false> IndexBuffer;
   /**
   either DXGI_FORMAT_R16_UINT or DXGI_FORMAT_R32_UINT
@@ -191,6 +191,10 @@ public:
       : MTLD3D11DeviceChild<ID3DDeviceContextState>(pDevice) {}
 
   ~MTLD3D11DeviceContextState() {}
+
+  /* The bindings this object holds while it is not the context's current
+   * state; a new object holds the default (cleared) state. */
+  D3D11ContextState state;
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) {
     if (ppvObject == nullptr)

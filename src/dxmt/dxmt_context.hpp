@@ -241,6 +241,7 @@ struct ClearEncoderData : EncoderData {
 struct ResolveEncoderData : EncoderData {
   TextureViewRef src;
   TextureViewRef dst;
+  uint32_t depth_stencil_planes; // DepthStencilPlanarFlags of the source
 };
 
 class Presenter;
@@ -695,6 +696,13 @@ public:
 
   void endPass();
 
+  /* D3D12 placed resources do not have a D3D11 allocation. They still need
+   * the same encoder dependencies when their Metal hazards are untracked. */
+  template <PipelineStage stage>
+  void trackExternalResource(GenericAccessTracker &tracker, int flags) {
+    track<stage>(tracker, flags);
+  }
+
   constexpr EncoderData *
   currentEncoder() {
     assert(encoder_current);
@@ -794,6 +802,11 @@ public:
   currentDeferredVisibilityQuery(uint32_t query_id) {
     assert(!deferred_visibility_query_stack_.empty());
     return deferred_visibility_query_stack_.back()[query_id];
+  }
+  Rc<VisibilityResultQuery> *
+  currentDeferredVisibilityQueries() {
+    assert(!deferred_visibility_query_stack_.empty());
+    return deferred_visibility_query_stack_.back();
   }
 
   void sampleTimestamp(Rc<TimestampQuery> &&query);

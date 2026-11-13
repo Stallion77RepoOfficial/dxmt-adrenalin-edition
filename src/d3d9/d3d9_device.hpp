@@ -1,16 +1,35 @@
 #pragma once
 
 #include "d3d9_private.h"
+#include "d3d11_1.h"
 #include "d3d9_surface.hpp"
+#include "d3d9_shader.hpp"
+#include "d3d9_vertex_declaration.hpp"
+/* The binding slots below hold private references, which need the complete
+ * type where the member is declared. */
+#include "d3d9_buffer.hpp"
+#include "d3d9_swapchain.hpp"
+#include "d3d9_stateblock.hpp"
+#include "d3d9_ffp.hpp"
+#include "d3d9_device_child.hpp"
+#include "util_env.hpp"
+#include <array>
 #include <atomic>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 
 namespace dxmt {
 
 class D3D9Interface;
+class D3D9VertexBuffer;
+class D3D9IndexBuffer;
+class D3D9SwapChain;
+class D3D9StateBlock;
 
 // Full IDirect3DDevice9Ex implementation wrapping D3D11.
-// Methods that are not yet implemented return E_NOTIMPL. Detailed D3D9 tracing
-// is opt-in via DXMT_D3D9_TRACE=1.
+// Methods that are not yet implemented return E_NOTIMPL.
 class D3D9Device final : public IDirect3DDevice9Ex {
 public:
   D3D9Device(
@@ -28,6 +47,25 @@ public:
   // Internal accessors for d3d9 resource objects
   ID3D11Device        *GetD3D11Device()  { return d3d11_device_.ptr(); }
   ID3D11DeviceContext *GetD3D11Context() { return d3d11_ctx_.ptr(); }
+  const D3DPRESENT_PARAMETERS &PresentParams() const { return present_params_; }
+  /* Resource locks report their cost here so DXMT_FPS can show it beside the
+   * draw work: a lock is a CPU/GPU rendezvous and does not appear in any of
+   * the other buckets. */
+  void AccountLock(double Seconds) { diag_lock_s_ += Seconds; locks_since_report_++; }
+  /* DXMT_FPS=1. Gates every diagnostic clock read: under Wine each one is a
+   * syscall, so they cannot run unconditionally on draws and locks. */
+  bool DiagnosticsEnabled() const { return fps_report_; }
+  /* D3DCREATE_MULTITHREADED: the application calls into the device from several
+   * threads, and every entry point holds this lock, for D3D9's own state and for
+   * the D3D11 context it records into, which takes one caller at a time. Without
+   * the flag D3D9 promises nothing across threads and the lock is never taken. */
+  std::unique_lock<std::recursive_mutex> LockDevice() {
+    return multithreaded_ ? std::unique_lock<std::recursive_mutex>(mutex_) : std::unique_lock<std::recursive_mutex>();
+  }
+  /* True when the IDirect3D9 this device came from was created by
+   * Direct3DCreate9Ex. That, and not which CreateDevice was called, is what
+   * decides whether this device and its swap chain answer to the Ex form. */
+  bool ExtendedInterface() const;
 
   // IUnknown
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObject) final;
@@ -181,24 +219,280 @@ private:
   Com<IDXGIAdapter>          dxgi_adapter_;
   Com<ID3D11Device>          d3d11_device_;
   Com<ID3D11DeviceContext>   d3d11_ctx_;
+  Com<ID3D11DeviceContext1>  constant_context_;
   Com<IDXGISwapChain>        swap_chain_;
   HWND                       focus_wnd_;
   DWORD                      behavior_flags_;
+  bool                       multithreaded_;
+  std::recursive_mutex       mutex_;
   D3DPRESENT_PARAMETERS      present_params_;
+  // DXMT_FPS=1: report frame rate and draws per frame from Present.
+  bool                       fps_report_ = env::getEnvVar("DXMT_FPS") == "1";
+  uint64_t                   draws_since_report_ = 0;
+  double                     diag_prepare_s_ = 0, diag_upload_s_ = 0, diag_bind_s_ = 0, diag_present_s_ = 0;
+  double                     diag_lock_s_ = 0;
+  uint64_t                   locks_since_report_ = 0;
   bool                       is_ex_;
   RECT                       scissor_rect_ = {};
+  D3DVIEWPORT9               viewport_ = {}; // as set; D3D11 gets it half a pixel on
+
+  /* The implicit objects, and every binding below them, are held privately.
+   *
+   * D3D9 gives the implicit swap chain, the implicit back buffer and the auto
+   * depth-stencil a public count that starts at zero, returns to zero without
+   * the object being freed, and is not forwarded to whatever contains them --
+   * so the device cannot be one of the holders of that count. It also requires
+   * SetRenderTarget, SetTexture, SetIndices and SetStreamSource to leave a
+   * count alone. A private reference does both: the object stays alive for as
+   * long as the device needs it while the application's count is its own.
+   *
+   * That is also what keeps the graph acyclic, since a child holds a public
+   * reference on the device (see D3D9DeviceChild): were these public, a bound
+   * object and the device would each keep the other alive forever. */
+  Com<D3D9SwapChain, false>  implicit_swapchain_;
 
   // Output-merger state (Phase 1)
   static constexpr UINT      kMaxRenderTargets = 4;
-  Com<D3D9Surface>           backbuffer_;                 // implicit swapchain back buffer
-  Com<D3D9Surface>           auto_depth_;                 // implicit auto depth-stencil
-  Com<D3D9Surface>           render_targets_[kMaxRenderTargets] = {};
-  Com<D3D9Surface>           depth_stencil_;
+  Com<D3D9Surface, false>    backbuffer_;                 // implicit swapchain back buffer
+  Com<D3D9Surface, false>    auto_depth_;                 // implicit auto depth-stencil
+  Com<D3D9Surface, false>    render_targets_[kMaxRenderTargets] = {};
+  Com<D3D9Surface, false>    depth_stencil_;
+
+  /* Back buffers 1..BackBufferCount-1. Back buffer 0 is the swap chain's
+   * own buffer; the others are plain render targets whose contents move one
+   * place up the chain on every Present, as D3D9 defines it. */
+  std::vector<Com<D3D9Surface, false>> extra_backbuffers_;
+  Com<ID3D11Texture2D>       rotate_temp_;
+  void RotateBackBuffers();
 
   // Rebind the currently set render targets / depth-stencil onto the D3D11 OM.
   void ApplyRenderTargets();
+  void SetDefaultViewport();
+  void ApplyViewport(const D3DVIEWPORT9 &viewport);
+  // The DXGI swap chain for present_params_, multisampled as they ask.
+  HRESULT CreateSwapChain();
+  UINT                       swapchain_samples_ = 1;
   // Build the implicit back buffer (and optional auto depth) surfaces.
   HRESULT CreateImplicitSurfaces();
+
+  /* Scratch storage for the user-pointer draws.
+   *
+   * DrawPrimitiveUP hands over its vertices by pointer and D3D11 has no such
+   * call, so the data has to reach a buffer somehow. Creating one per draw is
+   * the obvious translation and the wrong one: it is a GPU allocation on every
+   * draw call, and Unreal's menus issue tens of them a frame.
+   *
+   * One dynamic buffer per kind instead, written at a rolling offset --
+   * NO_OVERWRITE while there is room, DISCARD when it wraps, which is the
+   * contract that lets the driver keep the frames in flight apart. It grows
+   * only when a single draw wants more than it holds. */
+  struct UploadRing {
+    Com<ID3D11Buffer> buffer;
+    UINT              capacity = 0;
+    UINT              offset = 0;
+  };
+  UploadRing                 up_vertices_;
+  UploadRing                 up_indices_;
+  // Returns the byte offset the data was written at, or -1 on failure.
+  UINT WriteToUploadRing(UploadRing &ring, D3D11_BIND_FLAG Bind, const void *pData, UINT Size, UINT Alignment);
+
+  // Draw pipeline state
+  static constexpr UINT      kMaxStreams = 16;
+  static constexpr UINT      kMaxSamplers = 16;      // pixel stage s0..s15
+  static constexpr UINT      kMaxVertexSamplers = 4; // D3DVERTEXTEXTURESAMPLER0..3
+  static constexpr UINT      kTotalSamplers = kMaxSamplers + kMaxVertexSamplers;
+  static constexpr UINT      kMaxFloatConstants = 256;
+  static constexpr UINT      kMaxOtherConstants = 16; // i# / b# registers
+
+  struct StreamBinding {
+    Com<D3D9VertexBuffer, false> buffer;
+    UINT offset = 0;
+    UINT stride = 0;
+  };
+  StreamBinding              streams_[kMaxStreams] = {};
+  UINT                       stream_freq_[kMaxStreams] = {}; // raw SetStreamSourceFreq values, 1 = default
+  Com<D3D9IndexBuffer, false> index_buffer_;
+  Com<D3D9VertexDeclaration, false> vertex_decl_;
+  DWORD                      fvf_ = 0;
+  /* One declaration per FVF for the device's lifetime. Rebuilding it on every
+   * FVF change freed the previous one, whose memory -- and with it, before
+   * layouts were keyed on ids, its cached input layout -- went to the next. */
+  std::unordered_map<DWORD, Com<D3D9VertexDeclaration, false>> fvf_decls_;
+  Com<D3D9VertexShader, false> vertex_shader_;
+  Com<D3D9PixelShader, false>  pixel_shader_;
+
+  /* A bound texture. The slot can hold any of the three texture classes, so
+   * the private reference that keeps it alive is taken through their common
+   * base while the draw path reads the D3D9 interface. */
+  struct TextureBinding {
+    Com<D3D9PrivateRef, false> owner;
+    IDirect3DBaseTexture9     *texture = nullptr;
+
+    void Set(IDirect3DBaseTexture9 *tex);
+    explicit operator bool() const { return texture != nullptr; }
+  };
+  TextureBinding             textures_[kTotalSamplers] = {}; // 0..15 pixel, 16..19 vertex
+
+  // Per-sampler D3D9 state (indexed by D3DSAMPLERSTATETYPE, 1..13) and the
+  // cache of D3D11 sampler objects they resolve to.
+  DWORD                      sampler_state_[kTotalSamplers][14] = {};
+  static constexpr uint32_t   kAllSamplers = (1u << kTotalSamplers) - 1;
+  uint32_t                   samplers_dirty_ = kAllSamplers;
+  std::map<std::array<uint32_t, 10>, Com<ID3D11SamplerState>> sampler_cache_;
+  // Owned by sampler_cache_; resolve only the slots whose state or shadow
+  // comparison mode changed, rather than searching the map 20 times per draw.
+  std::array<ID3D11SamplerState *, kTotalSamplers> resolved_samplers_ = {};
+  uint16_t                   resolved_shadow_samplers_ = 0;
+  void InitDefaultSamplerState();
+  ID3D11SamplerState *GetOrCreateSampler(UINT stage, bool comparison = false);
+  // Pixel samplers the bound shader reads as shadow maps; they need
+  // comparison samplers.
+  uint16_t shadow_samplers_ = 0;
+
+  float                      vs_const_f_[kMaxFloatConstants * 4] = {};
+  float                      ps_const_f_[kMaxFloatConstants * 4] = {};
+  int                        vs_const_i_[kMaxOtherConstants * 4] = {};
+  int                        ps_const_i_[kMaxOtherConstants * 4] = {};
+  uint32_t                   vs_const_b_[kMaxOtherConstants] = {};
+  uint32_t                   ps_const_b_[kMaxOtherConstants] = {};
+  Com<ID3D11Buffer>          vs_cbuffer_;
+  Com<ID3D11Buffer>          ps_cbuffer_;
+  struct ConstantUpload {
+    UINT cursor = 0;
+    UINT first = 0;
+    UINT count = 0;
+    UINT uploaded = 0;
+  } vs_upload_, ps_upload_;
+  Com<ID3D11Buffer>          vs_cbuffer_extra_; // cb1: i#/b#/alpha-ref, layout in sm3_translate.hpp
+  Com<ID3D11Buffer>          ps_cbuffer_extra_;
+  bool                       vs_const_dirty_ = true;
+  bool                       ps_const_dirty_ = true;
+  bool                       vs_extra_dirty_ = true;
+  bool                       ps_extra_dirty_ = true;
+
+  /* (declaration, shader, stream frequencies) -> input layout, keyed on the
+   * objects' unique ids rather than their addresses, which get reused. The
+   * shader is the D3D9 vertex shader's id, or the generated fixed-function
+   * shader set's address (the FFP cache never frees one). Entries are not
+   * dropped when an object dies: a small, bounded leak of D3D11 objects. */
+  struct InputLayoutKey {
+    uint64_t declaration;
+    uint64_t shader;
+    bool fixed_function;
+    std::array<UINT, 16> stream_freq;
+    bool operator==(const InputLayoutKey &) const = default;
+  };
+  struct InputLayoutKeyHash {
+    size_t operator()(const InputLayoutKey &k) const {
+      uint64_t h = k.declaration * 0x9E3779B97F4A7C15ull ^ (k.shader + (k.fixed_function ? 0x51ED27ull : 0));
+      for (UINT f : k.stream_freq)
+        h = (h ^ f) * 0x100000001B3ull;
+      return (size_t)h;
+    }
+  };
+  struct CachedInputLayout {
+    Com<ID3D11InputLayout> layout;
+    bool null_stream = false; // some shader input has no declaration element
+  };
+  std::unordered_map<InputLayoutKey, CachedInputLayout, InputLayoutKeyHash> input_layout_cache_;
+  /* VertexInputConversions() of the last declaration and vertex shader. */
+  uint64_t conversions_declaration_ = 0;
+  uint64_t conversions_shader_ = 0;
+  uint32_t conversions_ = 0;
+  /* A shader input the declaration does not provide reads zeroes, as on D3D9
+   * hardware: it is fed from this stride-0 buffer in an input slot past
+   * D3D9's sixteen streams. */
+  static constexpr UINT      kNullStreamSlot = 16;
+  Com<ID3D11Buffer>          null_stream_buffer_;
+  void BindNullStream();
+  void UseInputLayout(const CachedInputLayout &cached);
+
+  const std::vector<D3DVERTEXELEMENT9> *CurrentDeclarationElements();
+  D3D9VertexDeclaration *CurrentDeclaration();
+  D3D9VertexDeclaration *ImplicitDeclarationForFVF(DWORD fvf);
+  HRESULT BindInputLayout();
+  uint32_t VertexInputConversions();
+  void UploadShaderConstants(bool programmable_vs, bool programmable_ps);
+  void BindTexturesAndSamplers();
+  HRESULT DrawPrepare(D3DPRIMITIVETYPE type);
+  // Instance count for DrawIndexedPrimitive when stream 0 uses
+  // D3DSTREAMSOURCE_INDEXEDDATA, or 0 when instancing is off.
+  UINT InstancedDrawCount() const;
+
+  // Growable shared index buffer turning a triangle fan with N primitives
+  // into a triangle list ((0,i+1,i+2) per triangle); D3D11 dropped fans.
+  Com<ID3D11Buffer>          fan_index_buffer_;
+  UINT                       fan_index_capacity_ = 0; // in primitives
+  bool EnsureFanIndexBuffer(UINT primCount);
+
+  // Full D3D9 render-state block plus caches for the D3D11 state objects it
+  // translates into (depth-stencil / rasterizer / blend), keyed on the packed
+  // relevant states so re-creation only happens on genuinely new combinations.
+  static constexpr UINT kMaxRenderStates = 256;
+  DWORD                      render_state_[kMaxRenderStates] = {};
+  bool                       render_state_dirty_ = true;
+  std::map<uint64_t, Com<ID3D11DepthStencilState>>            dss_cache_;
+  std::map<std::array<uint32_t, 4>, Com<ID3D11RasterizerState>> rs_cache_;
+  std::map<uint64_t, Com<ID3D11BlendState>>                   bs_cache_;
+  void InitDefaultRenderState();
+  void ApplyRenderState();
+
+  // Fixed-function state. Stored so Get* round-trips and state blocks work;
+  // the FFP draw path consumes it when no programmable shader is bound.
+  std::unordered_map<uint32_t, D3DMATRIX> transforms_; // D3DTS_* -> matrix, absent = identity
+  D3DMATERIAL9               material_ = {};
+  struct LightSlot {
+    D3DLIGHT9 light = {};
+    bool present = false;
+    bool enabled = false;
+  };
+  std::map<DWORD, LightSlot> lights_;
+  static constexpr UINT      kMaxClipPlanes = 8;
+  /* D3DRS_CLIPPLANEENABLE, unless D3DRS_CLIPPING turns all clipping off. */
+  bool UserClipPlanesEnabled() const {
+    return render_state_[D3DRS_CLIPPING] && (render_state_[D3DRS_CLIPPLANEENABLE] & 0xff);
+  }
+  float                      clip_planes_[kMaxClipPlanes][4] = {};
+  static constexpr UINT      kMaxTextureStages = 8;
+  static constexpr UINT      kMaxTextureStageStates = 33; // D3DTSS_CONSTANT == 32
+  DWORD                      tss_[kMaxTextureStages][kMaxTextureStageStates] = {};
+  void InitDefaultTextureStageState();
+
+  // Active BeginStateBlock/EndStateBlock recording, if any. Setters report
+  // into it so EndStateBlock captures exactly the touched states.
+  /* Private while recording: BeginStateBlock must not move the device's
+   * count, and EndStateBlock hands the block over with a public reference
+   * that does. */
+  Com<D3D9StateBlock, false> recording_;
+
+  // Fixed-function shader generation (used when no VS and/or PS is bound).
+  std::unique_ptr<FFPShaderCache> ffp_;
+  Com<ID3D11Buffer>          ffp_vs_cbuffer_;
+  Com<ID3D11Buffer>          ffp_ps_cbuffer_;
+  HRESULT BindInputLayoutFFP(D3D9VertexDeclaration *decl, FFPShaders *shaders, const FFPShaderKey &key);
+  void UploadFFPConstants(const FFPShaderKey &key, bool bind_vs, bool bind_ps);
+
+  // Shader-based blit for StretchRect calls CopySubresourceRegion can't
+  // express (scaling and/or format conversion).
+  Com<ID3D11VertexShader>    blit_vs_;
+  Com<ID3D11PixelShader>     blit_ps_;
+  Com<ID3D11InputLayout>     blit_layout_;
+  Com<ID3D11Buffer>          blit_vb_;
+  Com<ID3D11SamplerState>    blit_sampler_point_;
+  Com<ID3D11SamplerState>    blit_sampler_linear_;
+  Com<ID3D11RasterizerState> blit_rasterizer_;
+  bool EnsureBlitObjects();
+  HRESULT BlitSurface(ID3D11ShaderResourceView *srv, UINT src_width, UINT src_height, const RECT &sr,
+                      D3D9Surface *dst, const RECT &dr, bool linear);
+  /* A single-sample copy of a multisampled surface, for what StretchRect
+   * cannot resolve in one step: kept, and remade when the size or format
+   * changes. */
+  ID3D11Texture2D *ResolveToScratch(D3D9Surface *src, ID3D11ShaderResourceView **srv);
+  Com<ID3D11Texture2D>       resolve_scratch_;
+  Com<ID3D11ShaderResourceView> resolve_scratch_srv_;
+
+  friend class D3D9StateBlock;
+  friend class FFPShaderCache;
 };
 
 } // namespace dxmt

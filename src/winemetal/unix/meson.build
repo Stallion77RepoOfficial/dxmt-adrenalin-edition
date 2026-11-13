@@ -1,5 +1,6 @@
 winemetal_unix_src = [
   'winemetal_unix.c',
+  'msc_unix.c',
   'cache.c',
 ]
 

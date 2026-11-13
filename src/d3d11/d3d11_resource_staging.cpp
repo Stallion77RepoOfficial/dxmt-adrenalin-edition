@@ -22,7 +22,8 @@ public:
 
   Rc<StagingResource>
   staging(UINT Subresource) final {
-    assert(Subresource == 0);
+    if (Subresource)
+      return nullptr; // Map refuses it
     return internal;
   }
   Rc<DynamicBuffer>
@@ -77,7 +78,9 @@ public:
 
   Rc<StagingResource>
   staging(UINT Subresource) final {
-    return subresources.at(Subresource);
+    if (Subresource >= subresources.size())
+      return nullptr; // Map refuses it
+    return subresources[Subresource];
   }
   Rc<DynamicBuffer>
   dynamicBuffer(UINT *, UINT *) final {

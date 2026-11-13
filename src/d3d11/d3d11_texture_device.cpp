@@ -31,6 +31,81 @@ namespace dxmt {
 
 #pragma region DeviceTexture
 
+/* Whether a view dimension names a view of this kind of texture. It cannot be
+ * decided further down: a D3D11 Texture1D is a Metal 2D texture one texel
+ * high, so the view helpers, which only see the Metal texture, took a 1D view
+ * of a 2D texture. The SRV, UAV and RTV dimensions share their values for the
+ * kinds they have in common, so one table serves the three. */
+template <typename DESC1>
+static bool
+ViewDimensionNamesResource(UINT dimension) {
+  if constexpr (std::is_same_v<DESC1, D3D11_TEXTURE1D_DESC>)
+    return dimension == D3D11_SRV_DIMENSION_TEXTURE1D || dimension == D3D11_SRV_DIMENSION_TEXTURE1DARRAY;
+  else if constexpr (std::is_same_v<DESC1, D3D11_TEXTURE2D_DESC1>)
+    return dimension == D3D11_SRV_DIMENSION_TEXTURE2D || dimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY ||
+           dimension == D3D11_SRV_DIMENSION_TEXTURE2DMS || dimension == D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY ||
+           dimension == D3D11_SRV_DIMENSION_TEXTURECUBE || dimension == D3D11_SRV_DIMENSION_TEXTURECUBEARRAY;
+  else
+    return dimension == D3D11_SRV_DIMENSION_TEXTURE3D;
+}
+
+/* A typeless format is a family, not something to read or write through.
+ * The depth formats' X-typeless members are readable aspects, not families. */
+static bool
+IsTypelessViewFormat(DXGI_FORMAT format) {
+  switch (format) {
+  case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+  case DXGI_FORMAT_R32G32B32_TYPELESS:
+  case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+  case DXGI_FORMAT_R32G32_TYPELESS:
+  case DXGI_FORMAT_R32G8X24_TYPELESS:
+  case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+  case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+  case DXGI_FORMAT_R16G16_TYPELESS:
+  case DXGI_FORMAT_R32_TYPELESS:
+  case DXGI_FORMAT_R24G8_TYPELESS:
+  case DXGI_FORMAT_R8G8_TYPELESS:
+  case DXGI_FORMAT_R16_TYPELESS:
+  case DXGI_FORMAT_R8_TYPELESS:
+  case DXGI_FORMAT_BC1_TYPELESS:
+  case DXGI_FORMAT_BC2_TYPELESS:
+  case DXGI_FORMAT_BC3_TYPELESS:
+  case DXGI_FORMAT_BC4_TYPELESS:
+  case DXGI_FORMAT_BC5_TYPELESS:
+  case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+  case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+  case DXGI_FORMAT_BC6H_TYPELESS:
+  case DXGI_FORMAT_BC7_TYPELESS:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/* The mip level and slices a UAV names have to be the texture's. */
+static bool
+UnorderedAccessViewRangeValid(const D3D11_UNORDERED_ACCESS_VIEW_DESC1 &desc, UINT mip_levels, UINT array_size) {
+  auto slices_valid = [&](UINT first, UINT count) {
+    return count && first < array_size && (~count == 0 || count <= array_size - first);
+  };
+  switch (desc.ViewDimension) {
+  case D3D11_UAV_DIMENSION_TEXTURE1D:
+    return desc.Texture1D.MipSlice < mip_levels;
+  case D3D11_UAV_DIMENSION_TEXTURE1DARRAY:
+    return desc.Texture1DArray.MipSlice < mip_levels &&
+           slices_valid(desc.Texture1DArray.FirstArraySlice, desc.Texture1DArray.ArraySize);
+  case D3D11_UAV_DIMENSION_TEXTURE2D:
+    return desc.Texture2D.MipSlice < mip_levels;
+  case D3D11_UAV_DIMENSION_TEXTURE2DARRAY:
+    return desc.Texture2DArray.MipSlice < mip_levels &&
+           slices_valid(desc.Texture2DArray.FirstArraySlice, desc.Texture2DArray.ArraySize);
+  case D3D11_UAV_DIMENSION_TEXTURE3D:
+    return desc.Texture3D.MipSlice < mip_levels && desc.Texture3D.WSize;
+  default:
+    return false;
+  }
+}
+
 template <typename tag_texture>
 class DeviceTexture : public TResourceBase<tag_texture, IMTLMinLODClampable> {
 private:
@@ -161,7 +236,7 @@ public:
 
   HRESULT STDMETHODCALLTYPE CreateRenderTargetView(const D3D11_RENDER_TARGET_VIEW_DESC1 *pDesc,
                                  ID3D11RenderTargetView1 **ppView) override {
-    D3D11_RENDER_TARGET_VIEW_DESC1 finalDesc;
+    D3D11_RENDER_TARGET_VIEW_DESC1 finalDesc = {};
     if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc,
                                                     &finalDesc))) {
       return E_INVALIDARG;
@@ -173,12 +248,14 @@ public:
     } else {
       arraySize = this->desc.ArraySize;
     }
+    if (!ViewDimensionNamesResource<typename tag_texture::DESC1>(finalDesc.ViewDimension))
+      return E_INVALIDARG;
     MTL_RENDER_PASS_ATTACHMENT_DESC attachment_desc;
     if (FAILED(InitializeAndNormalizeViewDescriptor(
             this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc,
             attachment_desc, descriptor
         ))) {
-      return E_FAIL;
+      return E_INVALIDARG;
     }
     if (!ppView) {
       return S_FALSE;
@@ -189,9 +266,29 @@ public:
 
   HRESULT STDMETHODCALLTYPE CreateDepthStencilView(const D3D11_DEPTH_STENCIL_VIEW_DESC *pDesc,
                                  ID3D11DepthStencilView **ppView) override {
-    D3D11_DEPTH_STENCIL_VIEW_DESC finalDesc;
+    D3D11_DEPTH_STENCIL_VIEW_DESC finalDesc = {};
     if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc,
                                                     &finalDesc))) {
+      return E_INVALIDARG;
+    }
+    /* The view dimension has to name the resource it is a view of. This
+     * cannot be decided further down: a D3D11 Texture1D is a Metal 2D texture
+     * one texel high, so by the time the view helper sees the texture the two
+     * are indistinguishable and a 1D view of a 2D texture was accepted.
+     * UNKNOWN is refused here for the same reason -- reaching the helper it
+     * matched no case and came back as E_FAIL, where D3D11 documents
+     * E_INVALIDARG. */
+    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE1D_DESC>) {
+      if (finalDesc.ViewDimension != D3D11_DSV_DIMENSION_TEXTURE1D &&
+          finalDesc.ViewDimension != D3D11_DSV_DIMENSION_TEXTURE1DARRAY)
+        return E_INVALIDARG;
+    } else if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE2D_DESC1>) {
+      if (finalDesc.ViewDimension != D3D11_DSV_DIMENSION_TEXTURE2D &&
+          finalDesc.ViewDimension != D3D11_DSV_DIMENSION_TEXTURE2DARRAY &&
+          finalDesc.ViewDimension != D3D11_DSV_DIMENSION_TEXTURE2DMS &&
+          finalDesc.ViewDimension != D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY)
+        return E_INVALIDARG;
+    } else {
       return E_INVALIDARG;
     }
     TextureViewDescriptor descriptor;
@@ -202,11 +299,11 @@ public:
       arraySize = this->desc.ArraySize;
     }
     MTL_RENDER_PASS_ATTACHMENT_DESC attachment_desc;
-    if (FAILED(InitializeAndNormalizeViewDescriptor(
+    if (HRESULT hr = InitializeAndNormalizeViewDescriptor(
             this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc,
             attachment_desc, descriptor
-        ))) {
-      return E_FAIL;
+        ); FAILED(hr)) {
+      return hr;
     }
     if (!ppView) {
       return S_FALSE;
@@ -219,7 +316,7 @@ public:
   STDMETHODCALLTYPE
   CreateShaderResourceView(const D3D11_SHADER_RESOURCE_VIEW_DESC1 *pDesc,
                            ID3D11ShaderResourceView1 **ppView) override {
-    D3D11_SHADER_RESOURCE_VIEW_DESC1 finalDesc;
+    D3D11_SHADER_RESOURCE_VIEW_DESC1 finalDesc = {};
     if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc,
                                                     &finalDesc))) {
       ERR("DeviceTexture: Failed to create SRV descriptor");
@@ -232,11 +329,18 @@ public:
     } else {
       arraySize = this->desc.ArraySize;
     }
+    if (!ViewDimensionNamesResource<typename tag_texture::DESC1>(finalDesc.ViewDimension) ||
+        IsTypelessViewFormat(finalDesc.Format))
+      return E_INVALIDARG;
+    if constexpr (std::is_same_v<typename tag_texture::DESC1, D3D11_TEXTURE2D_DESC1>) {
+      if ((finalDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBE ||
+           finalDesc.ViewDimension == D3D11_SRV_DIMENSION_TEXTURECUBEARRAY) &&
+          !(this->desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE)) return E_INVALIDARG;
+    }
     if (FAILED(InitializeAndNormalizeViewDescriptor(
             this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
         ))) {
-      ERR("DeviceTexture: Failed to create texture SRV");
-      return E_FAIL;
+      return E_INVALIDARG;
     }
     if (!ppView) {
       return S_FALSE;
@@ -249,7 +353,7 @@ public:
   STDMETHODCALLTYPE
   CreateUnorderedAccessView(const D3D11_UNORDERED_ACCESS_VIEW_DESC1 *pDesc,
                             ID3D11UnorderedAccessView1 **ppView) override {
-    D3D11_UNORDERED_ACCESS_VIEW_DESC1 finalDesc;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC1 finalDesc = {};
     if (FAILED(ExtractEntireResourceViewDescription(&this->desc, pDesc,
                                                     &finalDesc))) {
       return E_INVALIDARG;
@@ -261,11 +365,14 @@ public:
     } else {
       arraySize = this->desc.ArraySize;
     }
+    if (!ViewDimensionNamesResource<typename tag_texture::DESC1>(finalDesc.ViewDimension) ||
+        IsTypelessViewFormat(finalDesc.Format) ||
+        !UnorderedAccessViewRangeValid(finalDesc, this->desc.MipLevels, arraySize))
+      return E_INVALIDARG;
     if (FAILED(InitializeAndNormalizeViewDescriptor(
             this->m_parent, this->desc.MipLevels, arraySize, this->texture_.ptr(), finalDesc, descriptor
         ))) {
-      ERR("DeviceTexture: Failed to create texture UAV");
-      return E_FAIL;
+      return E_INVALIDARG;
     }
     if (!ppView) {
       return S_FALSE;
@@ -469,6 +576,34 @@ CreateDeviceTexture1D(MTLD3D11Device *pDevice,
                       ID3D11Texture1D **ppTexture) {
   return CreateDeviceTextureInternal<tag_texture_1d>(pDevice, pDesc,
                                                      pInitialData, ppTexture);
+}
+
+// Private interop for D3D12 placed resources. Keep the original Metal heap
+// allocation; creating an ordinary D3D11 texture here would allocate unrelated
+// storage and lose uploads, aliasing, and render-target contents.
+extern "C" HRESULT WINAPI
+DXMTCreateTextureFromAllocation(ID3D11Device *device, D3D11_RESOURCE_DIMENSION dimension, const void *desc,
+                                Texture *backing, ID3D11Resource **out) {
+  if (!out) return E_POINTER;
+  *out = nullptr;
+  if (!device || !desc || !backing || !backing->current()) return E_INVALIDARG;
+  auto *owner = static_cast<MTLD3D11Device *>(device);
+  switch (dimension) {
+  case D3D11_RESOURCE_DIMENSION_TEXTURE1D:
+    *out = reinterpret_cast<ID3D11Texture1D *>(ref(new DeviceTexture<tag_texture_1d>(
+        static_cast<const D3D11_TEXTURE1D_DESC *>(desc), Rc<Texture>(backing), owner)));
+    break;
+  case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
+    *out = reinterpret_cast<ID3D11Texture2D1 *>(ref(new DeviceTexture<tag_texture_2d>(
+        static_cast<const D3D11_TEXTURE2D_DESC1 *>(desc), Rc<Texture>(backing), owner)));
+    break;
+  case D3D11_RESOURCE_DIMENSION_TEXTURE3D:
+    *out = reinterpret_cast<ID3D11Texture3D1 *>(ref(new DeviceTexture<tag_texture_3d>(
+        static_cast<const D3D11_TEXTURE3D_DESC1 *>(desc), Rc<Texture>(backing), owner)));
+    break;
+  default: return E_INVALIDARG;
+  }
+  return S_OK;
 }
 
 HRESULT

@@ -215,7 +215,7 @@ int main(int argc, char **argv) {
   }
 
   SM50_SHADER_COMMON_DATA data;
-  data.metal_version = SM50_SHADER_METAL_320;
+  data.metal_version = SM50_SHADER_METAL_400;
   data.flags = {};
   data.next = 0;
   data.type = SM50_SHADER_COMMON;
@@ -394,7 +394,10 @@ int main(int argc, char **argv) {
     M.print(Out->os(), nullptr, PreserveAssemblyUseListOrder);
   } else if (EmitMetallib) {
     dxmt::metallib::MetallibWriter writer;
-    writer.Write(M, Out->os());
+    if (!writer.Write(M, Out->os())) {
+      errs() << "failed to assemble AIR bitcode via air-as\n";
+      return 1;
+    }
   } else {
     WriteBitcodeToFile(
       M, Out->os(), PreserveBitcodeUseListOrder, nullptr, true

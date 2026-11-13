@@ -21,6 +21,14 @@ if native_llvm_path.startswith('/usr/local/opt')
   ]
 endif
 
+# Homebrew ships libLLVM-<major>.dylib plus an unversioned libLLVM.dylib; the
+# arm64 build links whatever LLVM /opt/homebrew has (23 at the moment).
+if fs.is_file(join_paths(native_llvm_path, 'lib', 'libLLVM-22.dylib'))
+  llvm_deps_darwin = llvm_deps
+else
+  llvm_deps_darwin = ['-lLLVM']
+endif
+
 airconv_lib_darwin = static_library('airconv', airconv_src,
   include_directories : [ dxmt_include_path, llvm_include_path_darwin ],
   cpp_args            : [ airconv_args ],
@@ -32,13 +40,13 @@ airconv_lib_darwin = static_library('airconv', airconv_src,
 airconv_dep_darwin = declare_dependency(
   link_with           : [ airconv_lib_darwin ],
   include_directories : [ dxmt_include_path, include_directories('..') ],
-  link_args           : [ llvm_ld_flags_darwin, llvm_deps ] # meh
+  link_args           : [ llvm_ld_flags_darwin, llvm_deps_darwin ] # meh
 )
 
 executable('airconv', airconv_src + airconv_cli_src,
   include_directories : [ dxmt_include_path, llvm_include_path_darwin ],
   cpp_args            : [ airconv_args ],
   dependencies        : [ dxbc_parser_native_dep ],
-  link_args           : [ llvm_ld_flags_darwin, llvm_deps ],
+  link_args           : [ llvm_ld_flags_darwin, llvm_deps_darwin ],
   native              : dxmt_crossbuild
 )

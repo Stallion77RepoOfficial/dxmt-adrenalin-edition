@@ -103,6 +103,15 @@ public:
   TextureView &operator=(TextureView &&) = delete;
   TextureView(TextureAllocation *allocation);
   TextureView(TextureAllocation *allocation, unsigned index, TextureViewDescriptor descriptor);
+  /* A view over a texture DXMT did not allocate. D3D12 places its own textures
+   * in an MTLHeap it owns, so there is no TextureAllocation behind them and
+   * `allocation` stays null.
+   *
+   * Only valid as a colour attachment: the depth and stencil paths reach
+   * through `allocation` for their end-of-pass access tracking, and the
+   * residency machinery is keyed on allocations too, so a caller using this
+   * owns residency itself. */
+  TextureView(WMT::Reference<WMT::Texture> &&texture, uint64_t gpu_resource_id);
 
 private:
   std::atomic<uint32_t> refcount_ = {0u};
@@ -153,7 +162,7 @@ public:
 private:
   TextureAllocation(
       Texture *descriptor, WMT::Reference<WMT::Buffer> &&buffer, void *mapped_buffer, const WMTTextureInfo &info,
-      unsigned bytes_per_row, Flags<TextureAllocationFlag> flags
+      unsigned bytes_per_row, Flags<TextureAllocationFlag> flags, uint64_t buffer_offset = 0
   );
   TextureAllocation(
       Texture *descriptor, WMT::Reference<WMT::Texture> &&texture, const WMTTextureInfo &textureDescriptor,
@@ -270,7 +279,20 @@ public:
   TextureViewKey fullView;
 
   Rc<TextureAllocation> allocate(Flags<TextureAllocationFlag> flags);
+
+  /* A texture over memory this Texture does not own.
+   *
+   * D3D11 lets a buffer be a render target, which Metal has no direct notion
+   * of -- but it does let a texture be created over a buffer's memory, and on
+   * Apple silicon such a texture can carry render target usage. So a buffer
+   * render target view is a linear texture aliasing the application's buffer,
+   * and this is how it gets one. The buffer is retained for as long as the
+   * allocation lives; the caller is responsible for the allocation not being
+   * renamed underneath it, which a DEFAULT-usage buffer never is. */
+  Rc<TextureAllocation>
+  allocateOver(WMT::Buffer buffer, void *mapped, uint64_t offset, Flags<TextureAllocationFlag> flags);
   Rc<TextureAllocation> import(mach_port_t mach_port);
+  Rc<TextureAllocation> importTexture(WMT::Texture texture, uint64_t gpu_resource_id);
 
   TextureView &view(TextureViewKey key);
   TextureView &view(TextureViewKey key, TextureAllocation *allocation);

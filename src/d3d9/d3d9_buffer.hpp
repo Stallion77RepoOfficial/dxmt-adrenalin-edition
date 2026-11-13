@@ -1,7 +1,7 @@
 #pragma once
 
 #include "d3d9_private.h"
-#include "com/com_object.hpp"
+#include "d3d9_device_child.hpp"
 #include <vector>
 
 namespace dxmt {
@@ -17,7 +17,7 @@ class D3D9Device;
 // Map(WRITE_DISCARD/NO_OVERWRITE), everything else uses UpdateSubresource. The
 // shadow also makes GetData-style read-back and partial locks trivial.
 template <typename Interface, typename DescType>
-class D3D9Buffer : public ComObjectClamp<Interface> {
+class D3D9Buffer : public D3D9DeviceChild<Interface> {
 public:
   D3D9Buffer(D3D9Device *pDevice, UINT Length, DWORD Usage, D3DPOOL Pool, const DescType &Desc);
 
@@ -35,9 +35,13 @@ public:
 
   // IDirect3DResource9
   HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice9 **ppDevice) final;
-  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, const void *, DWORD, DWORD) final { return D3D_OK; }
-  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, void *, DWORD *) final { return D3DERR_NOTFOUND; }
-  HRESULT STDMETHODCALLTYPE FreePrivateData(REFGUID) final { return D3D_OK; }
+  HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID guid, const void *data, DWORD size, DWORD flags) final {
+    return private_data_.Set(guid, data, size, flags);
+  }
+  HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID guid, void *data, DWORD *size) final {
+    return private_data_.Get(guid, data, size);
+  }
+  HRESULT STDMETHODCALLTYPE FreePrivateData(REFGUID guid) final { return private_data_.Free(guid); }
   DWORD   STDMETHODCALLTYPE SetPriority(DWORD Priority) final { DWORD o = priority_; priority_ = Priority; return o; }
   DWORD   STDMETHODCALLTYPE GetPriority() final { return priority_; }
   void    STDMETHODCALLTYPE PreLoad() final {}
@@ -55,9 +59,12 @@ public:
   // Internal accessors used by the device when binding the buffer.
   ID3D11Buffer *GetD3D11Buffer() const { return buffer_.ptr(); }
   UINT          Length()        const { return length_; }
+  // CPU shadow contents (kept in sync by Lock/Unlock) - used by the device
+  // for CPU-side index rewrites such as triangle-fan emulation.
+  const uint8_t *ShadowData()   const { return shadow_.data(); }
 
 protected:
-  D3D9Device          *device_;
+  D3D9PrivateData private_data_;
   Com<ID3D11Buffer>    buffer_;
   std::vector<uint8_t> shadow_;
   UINT                 length_;

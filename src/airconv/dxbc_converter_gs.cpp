@@ -146,6 +146,7 @@ convert_dxbc_geometry_shader(
     topology = air::MeshOutputTopology::Line;
     break;
   case microsoft::D3D10_SB_PRIMITIVE_TOPOLOGY_POINTLIST:
+    func_signature.DefineMeshVertexOutput(air::OutputPointSize{});
     break;
   default:
     return llvm::make_error<UnsupportedFeature>("unsupported geometry shader output topology");
@@ -319,6 +320,7 @@ convert_dxbc_geometry_shader(
         co_yield h(gs_out_ctx);
       }
       emit_clip_distances(current_write_vertex);
+      air.CreateSetMeshPointSize(current_write_vertex, air.getFloat(1.0));
       air.CreateSetMeshIndex(current_write_vertex, current_write_vertex);
       co_return {};
     };
@@ -340,16 +342,21 @@ convert_dxbc_geometry_shader(
   auto input_per_vertex_type_float = llvm::ArrayType::get(types._float4, pVertexStage->max_output_register);
 
   auto input_ptr_int4_type = llvm::ArrayType::get(input_per_vertex_type,  vertex_per_primitive);
+  auto input_ptr_float4_type = llvm::ArrayType::get(input_per_vertex_type_float, vertex_per_primitive);
   resource_map.input.ptr_int4 = builder.CreateAlloca(input_ptr_int4_type);
   resource_map.input.ptr_float4 = builder.CreateBitCast(
       resource_map.input.ptr_int4,
-      llvm::ArrayType::get(input_per_vertex_type_float, vertex_per_primitive)->getPointerTo()
+      input_ptr_float4_type->getPointerTo()
   );
+  resource_map.input.elem_type_int4 = input_ptr_int4_type;
+  resource_map.input.elem_type_float4 = input_ptr_float4_type;
   resource_map.input_element_count = pVertexStage->max_output_register;
 
-  resource_map.output.ptr_int4 = builder.CreateAlloca(llvm::ArrayType::get(types._int4, max_output_register));
+  resource_map.output.elem_type_int4 = llvm::ArrayType::get(types._int4, max_output_register);
+  resource_map.output.elem_type_float4 = llvm::ArrayType::get(types._float4, max_output_register);
+  resource_map.output.ptr_int4 = builder.CreateAlloca(resource_map.output.elem_type_int4);
   resource_map.output.ptr_float4 = builder.CreateBitCast(
-      resource_map.output.ptr_int4, llvm::ArrayType::get(types._float4, max_output_register)->getPointerTo()
+      resource_map.output.ptr_int4, resource_map.output.elem_type_float4->getPointerTo()
   );
   resource_map.output_element_count = max_output_register;
 
@@ -494,7 +501,10 @@ convert_dxbc_geometry_shader(
   if (auto err = resource_map.call_cut().build(ctx).takeError()) {
     return err;
   }
-  air.CreateSetMeshPrimitiveCount(builder.CreateLoad(types._int, primitive_count));
+  if (topology == air::MeshOutputTopology::Point)
+    air.CreateSetMeshPrimitiveCount(builder.CreateLoad(types._int, next_write_vertex));
+  else
+    air.CreateSetMeshPrimitiveCount(builder.CreateLoad(types._int, primitive_count));
 
   builder.CreateRetVoid();
   module.getOrInsertNamedMetadata("air.mesh")->addOperand(function_metadata);
@@ -626,9 +636,11 @@ convert_dxbc_vertex_for_geometry_shader(
 
   auto vertex_count = builder.CreateExtractValue(draw_arguments, 0);
 
-  resource_map.input.ptr_int4 = builder.CreateAlloca(llvm::ArrayType::get(types._int4, max_input_register));
+  resource_map.input.elem_type_int4 = llvm::ArrayType::get(types._int4, max_input_register);
+  resource_map.input.elem_type_float4 = llvm::ArrayType::get(types._float4, max_input_register);
+  resource_map.input.ptr_int4 = builder.CreateAlloca(resource_map.input.elem_type_int4);
   resource_map.input.ptr_float4 = builder.CreateBitCast(
-      resource_map.input.ptr_int4, llvm::ArrayType::get(types._float4, max_input_register)->getPointerTo()
+      resource_map.input.ptr_int4, resource_map.input.elem_type_float4->getPointerTo()
   );
   resource_map.input_element_count = max_input_register;
 
@@ -639,6 +651,8 @@ convert_dxbc_vertex_for_geometry_shader(
       types._int, payload, 4
   );
 
+  resource_map.output.elem_type_int4 = llvm::ArrayType::get(types._int4, max_output_register);
+  resource_map.output.elem_type_float4 = llvm::ArrayType::get(types._float4, max_output_register);
   resource_map.output.ptr_int4 = builder.CreateBitCast(
       payload_output_ptr,
       llvm::ArrayType::get(types._int4, max_output_register)->getPointerTo((uint32_t)air::AddressSpace::object_data)

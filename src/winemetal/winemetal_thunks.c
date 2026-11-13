@@ -450,6 +450,23 @@ MTLTexture_mipmapLevelCount(obj_handle_t texture) {
   return params.ret;
 }
 WINEMETAL_API void
+MTLTexture_getBytes(
+    obj_handle_t texture, struct WMTMemoryPointer data, uint64_t bytes_per_row, uint64_t bytes_per_image,
+    struct WMTOrigin origin, struct WMTSize size, uint64_t level, uint64_t slice
+) {
+  struct unixcall_mtltexture_getbytes params;
+  params.texture = texture;
+  params.origin = origin;
+  params.size = size;
+  params.level = level;
+  params.slice = slice;
+  params.data = data;
+  params.bytes_per_row = bytes_per_row;
+  params.bytes_per_image = bytes_per_image;
+  UNIX_CALL(149, &params);
+}
+
+WINEMETAL_API void
 MTLTexture_replaceRegion(
     obj_handle_t texture, struct WMTOrigin origin, struct WMTSize size, uint64_t level, uint64_t slice,
     struct WMTMemoryPointer data, uint64_t bytes_per_row, uint64_t bytes_per_image
@@ -1184,4 +1201,82 @@ WINEMETAL_API void
 WMTEnableDeveloperHUD() {
   uint64_t unused = 0;
   UNIX_CALL(132, &unused);
+}
+
+/* 133-140 are the Metal Shader Converter bridge, see msc_thunks.c. */
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newHeap(obj_handle_t device, const struct WMTHeapInfo *info) {
+  struct unixcall_mtldevice_newheap params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.ret = 0;
+  UNIX_CALL(141, &params);
+  return params.ret;
+}
+
+WINEMETAL_API void
+MTLDevice_heapBufferSizeAndAlign(
+    obj_handle_t device, uint64_t length, enum WMTResourceOptions options, struct WMTSizeAndAlign *out
+) {
+  struct unixcall_mtldevice_heapbuffersizeandalign params;
+  params.device = device;
+  params.length = length;
+  params.options = options;
+  WMT_MEMPTR_SET(params.out, out);
+  UNIX_CALL(142, &params);
+}
+
+WINEMETAL_API void
+MTLDevice_heapTextureSizeAndAlign(obj_handle_t device, const struct WMTTextureInfo *info, struct WMTSizeAndAlign *out) {
+  struct unixcall_mtldevice_heaptexturesizeandalign params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  WMT_MEMPTR_SET(params.out, out);
+  UNIX_CALL(143, &params);
+}
+
+WINEMETAL_API obj_handle_t
+MTLHeap_newBuffer(obj_handle_t heap, struct WMTBufferInfo *info, uint64_t offset) {
+  struct unixcall_mtlheap_newresource params;
+  params.heap = heap;
+  WMT_MEMPTR_SET(params.info, info);
+  params.offset = offset;
+  params.ret = 0;
+  UNIX_CALL(144, &params);
+  return params.ret;
+}
+
+WINEMETAL_API obj_handle_t
+MTLHeap_newTexture(obj_handle_t heap, struct WMTTextureInfo *info, uint64_t offset) {
+  struct unixcall_mtlheap_newresource params;
+  params.heap = heap;
+  WMT_MEMPTR_SET(params.info, info);
+  params.offset = offset;
+  params.ret = 0;
+  UNIX_CALL(145, &params);
+  return params.ret;
+}
+
+WINEMETAL_API uint32_t
+MTLFunction_vertexAttributes(obj_handle_t function, struct WMTVertexAttributeInfo *out, uint32_t capacity) {
+  struct unixcall_mtlfunction_vertexattributes params;
+  params.function = function;
+  WMT_MEMPTR_SET(params.out, out);
+  params.capacity = capacity;
+  params.ret = 0;
+  UNIX_CALL(147, &params);
+  return params.ret;
+}
+
+WINEMETAL_API uint64_t
+MTLHeap_property(obj_handle_t heap, enum WMTHeapProperty prop, uint64_t arg) {
+  struct unixcall_mtlheap_property params;
+  params.heap = heap;
+  params.arg = arg;
+  params.prop = prop;
+  params.padding = 0;
+  params.ret = 0;
+  UNIX_CALL(146, &params);
+  return params.ret;
 }

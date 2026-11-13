@@ -537,6 +537,10 @@ struct InputPosition {
   Interpolation interpolation;
 };
 
+/* Where in a point primitive the fragment lies, (0,0) top-left to (1,1). D3D
+ * has no such value: D3D9 point sprites replace texture coordinates with it. */
+struct InputPointCoord {};                  // float2
+
 struct InputThreadIndexInThreadgroup {};    // uint
 struct InputThreadPositionInThreadgroup {}; // uint3
 struct InputThreadPositionInGrid {};        // uint3
@@ -595,7 +599,7 @@ using FunctionInput = template_concat_t<
     /* fragment */
     InputPrimitiveID, InputViewportArrayIndex, InputRenderTargetArrayIndex,
     InputFrontFacing, InputPosition, InputSampleIndex, //
-    InputFragmentStageIn, InputInputCoverage,
+    InputFragmentStageIn, InputInputCoverage, InputPointCoord,
     /* object & mesh */
     InputPayload, InputMeshGridProperties, InputMesh,
     /* kernel */
@@ -606,7 +610,7 @@ using FunctionInput = template_concat_t<
 using FunctionOutput = std::variant<
   /* vertex */
   OutputVertex, OutputPosition, OutputClipDistance,
-  OutputRenderTargetArrayIndex, OutputViewportArrayIndex,
+  OutputRenderTargetArrayIndex, OutputViewportArrayIndex, OutputPointSize,
   /* fragment */
   OutputRenderTarget, OutputDepth, OutputCoverageMask, OutputStencilRef>;
 

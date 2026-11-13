@@ -4,7 +4,8 @@
 
 namespace dxmt {
 
-constexpr int kDXMTShaderCacheVersion = 20;
+// Shader control flow and geometry point output changed; recompile old entries.
+constexpr int kDXMTShaderCacheVersion = 21;
 
 class ShaderCache {
 public:

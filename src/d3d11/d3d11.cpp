@@ -21,9 +21,11 @@
 #include "com/com_pointer.hpp"
 #include "config/config.hpp"
 #include "d3d11_device.hpp"
+#include "d3d11_on12.hpp"
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include "dxmt_capture.hpp"
+#include <algorithm>
 #include <exception>
 
 namespace dxmt {
@@ -215,6 +217,8 @@ extern "C" HRESULT WINAPI D3D11CreateDevice(
                                        pFeatureLevel, ppImmediateContext);
 }
 
+/* The device a DXMT D3D12 device records through is the 11on12 device: the
+ * two APIs share its command stream, so the queues need no bridging. */
 extern "C" HRESULT __stdcall D3D11On12CreateDevice(
     IUnknown *pDevice, UINT Flags, const D3D_FEATURE_LEVEL *pFeatureLevels,
     UINT FeatureLevels, IUnknown *const *ppCommandQueues, UINT NumQueues,
@@ -223,7 +227,44 @@ extern "C" HRESULT __stdcall D3D11On12CreateDevice(
     D3D_FEATURE_LEVEL *pChosenFeatureLevel) {
   InitReturnPtr(ppDevice);
   InitReturnPtr(ppImmediateContext);
-  return E_NOTIMPL;
+  if (pChosenFeatureLevel)
+    *pChosenFeatureLevel = D3D_FEATURE_LEVEL();
+  if (!pDevice)
+    return E_INVALIDARG;
+
+  /* Unity and other engines that start on D3D12 give it up for D3D11 when
+   * this fails, and D3D11 is the path DXMT runs them well on; its D3D12 does
+   * not carry them yet. So 11on12 waits behind an option. */
+  if (!Config::getInstance().getOption<bool>("d3d11.allow11On12", false))
+    return E_NOTIMPL;
+
+  Com<IMTLD3D12DeviceInterop> interop;
+  if (FAILED(pDevice->QueryInterface(IID_PPV_ARGS(&interop)))) {
+    Logger::err("D3D11On12CreateDevice: not a DXMT D3D12 device");
+    return E_INVALIDARG;
+  }
+  Com<ID3D11Device> device;
+  HRESULT hr = interop->GetD3D11Device(&device);
+  if (FAILED(hr))
+    return hr;
+
+  D3D_FEATURE_LEVEL level = device->GetFeatureLevel();
+  if (pFeatureLevels && FeatureLevels) {
+    auto end = pFeatureLevels + FeatureLevels;
+    auto supported = std::find_if(pFeatureLevels, end, [&](D3D_FEATURE_LEVEL requested) { return requested <= level; });
+    if (supported == end)
+      return E_INVALIDARG;
+    level = *supported;
+  }
+
+  static_cast<MTLD3D11Device *>(device.ptr())->SetD3D12Device(pDevice);
+  if (pChosenFeatureLevel)
+    *pChosenFeatureLevel = level;
+  if (ppImmediateContext)
+    device->GetImmediateContext(ppImmediateContext);
+  if (ppDevice)
+    *ppDevice = device.ref();
+  return S_OK;
 }
 
 } // namespace dxmt

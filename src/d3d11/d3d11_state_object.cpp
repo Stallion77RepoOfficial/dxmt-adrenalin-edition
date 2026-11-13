@@ -566,6 +566,22 @@ HRESULT StateObjectCache<D3D11_DEPTH_STENCIL_DESC, IMTLD3D11DepthStencilState>::
   if (!pDesc)
     return E_INVALIDARG;
 
+  /* What a disabled test leaves unused reads back as its default, and two
+   * descriptions differing only there are the same state. */
+  D3D11_DEPTH_STENCIL_DESC normalized = *pDesc;
+  if (!normalized.DepthEnable) {
+    normalized.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    normalized.DepthFunc = D3D11_COMPARISON_LESS;
+  }
+  if (!normalized.StencilEnable) {
+    normalized.StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK;
+    normalized.StencilWriteMask = D3D11_DEFAULT_STENCIL_WRITE_MASK;
+    normalized.FrontFace = {D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP,
+                            D3D11_COMPARISON_ALWAYS};
+    normalized.BackFace = normalized.FrontFace;
+  }
+  pDesc = &normalized;
+
   if (!ppDepthStencilState)
     return S_FALSE;
 
@@ -690,15 +706,24 @@ StateObjectCache<D3D11_SAMPLER_DESC, D3D11SamplerState>::CreateStateObject(
   if (pSamplerDesc == nullptr)
     return E_INVALIDARG;
 
+  /* The fields the filter and address modes leave unused read back as their
+   * defaults, and two descriptions differing only there are the same state. */
   D3D11_SAMPLER_DESC desc = *pSamplerDesc;
+  if (!D3D11_DECODE_IS_ANISOTROPIC_FILTER(desc.Filter))
+    desc.MaxAnisotropy = 0;
+  if (!D3D11_DECODE_IS_COMPARISON_FILTER(desc.Filter))
+    desc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+  if (desc.AddressU != D3D11_TEXTURE_ADDRESS_BORDER && desc.AddressV != D3D11_TEXTURE_ADDRESS_BORDER &&
+      desc.AddressW != D3D11_TEXTURE_ADDRESS_BORDER)
+    std::fill(std::begin(desc.BorderColor), std::end(desc.BorderColor), 0.0f);
 
   // FIXME: validation
 
   if (!ppSamplerState)
     return S_FALSE;
 
-  if (cache.contains(*pSamplerDesc)) {
-    cache.at(*pSamplerDesc)->QueryInterface(__uuidof(ID3D11SamplerState), (void **)ppSamplerState);
+  if (cache.contains(desc)) {
+    cache.at(desc)->QueryInterface(__uuidof(ID3D11SamplerState), (void **)ppSamplerState);
     return S_OK;
   }
 
@@ -786,8 +811,8 @@ StateObjectCache<D3D11_SAMPLER_DESC, D3D11SamplerState>::CreateStateObject(
     return E_FAIL;
   }
 
-  cache.emplace(*pSamplerDesc, std::make_unique<MTLD3D11SamplerState>(device, std::move(sampler), desc));
-  cache.at(*pSamplerDesc)->QueryInterface(__uuidof(ID3D11SamplerState), (void **)ppSamplerState);
+  cache.emplace(desc, std::make_unique<MTLD3D11SamplerState>(device, std::move(sampler), desc));
+  cache.at(desc)->QueryInterface(__uuidof(ID3D11SamplerState), (void **)ppSamplerState);
 
   return S_OK;
 };
@@ -819,6 +844,23 @@ StateObjectCache<D3D11_BLEND_DESC1, IMTLD3D11BlendState>::CreateStateObject(
       bool(desc_normalized.AlphaToCoverageEnable);
   desc_normalized.IndependentBlendEnable =
       bool(desc_normalized.IndependentBlendEnable);
+  /* Without independent blending every target reads back as the first; a
+   * target that does not blend reads back with the default factors. */
+  for (unsigned i = 0; i < 8; i++) {
+    auto &target = desc_normalized.RenderTarget[i];
+    if (i && !desc_normalized.IndependentBlendEnable) {
+      target = desc_normalized.RenderTarget[0];
+      continue;
+    }
+    if (!target.BlendEnable) {
+      target.SrcBlend = D3D11_BLEND_ONE;
+      target.DestBlend = D3D11_BLEND_ZERO;
+      target.BlendOp = D3D11_BLEND_OP_ADD;
+      target.SrcBlendAlpha = D3D11_BLEND_ONE;
+      target.DestBlendAlpha = D3D11_BLEND_ZERO;
+      target.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    }
+  }
 
   if (cache.contains(desc_normalized)) {
     cache.at(desc_normalized)->QueryInterface(IID_PPV_ARGS(ppBlendState));

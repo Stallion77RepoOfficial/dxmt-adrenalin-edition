@@ -1,6 +1,9 @@
 #pragma once
+#include <chrono>
 #include <concepts>
 #include <functional>
+#include "util_env.hpp"
+#include "util_likely.hpp"
 
 namespace dxmt {
 
@@ -114,12 +117,71 @@ public:
 
   void
   execute(Context &context) {
+    if (unlikely(profileCommands())) {
+      executeProfiled(context);
+      return;
+    }
     impl::CommandBase<Context> *cur = &empty;
+    uint64_t n = 0;
     while (cur) {
       cur->invoke(context);
       cur = cur->next;
+      n++;
     }
+    last_command_count = n;
+    last_slow_commands = 0;
+    last_worst_command = {};
+    last_worst_index = 0;
+    last_worst_vptr = nullptr;
   };
+
+  /* DXMT_PROFILE_COMMANDS=1 times every replayed command. Off by default: a
+   * clock read is a syscall under Wine (~350 ns on an M4, two per command),
+   * which on its own outweighed the replay work it was measuring. */
+  static bool
+  profileCommands() {
+    static const bool enabled = env::getEnvVar("DXMT_PROFILE_COMMANDS") == "1";
+    return enabled;
+  }
+
+  void
+  executeProfiled(Context &context) {
+    impl::CommandBase<Context> *cur = &empty;
+    uint64_t n = 0;
+    /* Replaying the recorded commands is where a stalled frame spends its
+     * time, and the shape of that time is the whole question: 250 commands at
+     * a millisecond each is a different bug from five commands at fifty. */
+    uint64_t slow = 0;
+    auto worst = std::chrono::steady_clock::duration::zero();
+    while (cur) {
+      auto t0 = std::chrono::steady_clock::now();
+      cur->invoke(context);
+      auto d = std::chrono::steady_clock::now() - t0;
+      if (d > std::chrono::milliseconds(1)) slow++;
+      /* Which command, not just how long: the present is recorded last, so an
+       * index at the end of the list names it without needing the type back. */
+      if (d > worst) {
+        worst = d;
+        last_worst_index = n;
+        /* The commands are type-erased lambdas, so the only thing that names
+         * one is its vtable: resolve this address against d3d11.dll's symbols
+         * and the slow command has a name. Temporary -- goes once the stall
+         * is identified. */
+        last_worst_vptr = *reinterpret_cast<void *const *>(cur);
+      }
+      cur = cur->next;
+      n++;
+    }
+    last_command_count = n;
+    last_slow_commands = slow;
+    last_worst_command = worst;
+  };
+
+  uint64_t last_command_count = 0;
+  uint64_t last_slow_commands = 0;
+  std::chrono::steady_clock::duration last_worst_command{};
+  uint64_t last_worst_index = 0;
+  void *last_worst_vptr = nullptr;
 };
 
 }; // namespace dxmt

@@ -57,14 +57,14 @@ TextureView::TextureView(TextureAllocation *allocation, unsigned index, TextureV
 
 TextureAllocation::TextureAllocation(
     Texture *descriptor, WMT::Reference<WMT::Buffer> &&buffer, void *mapped_buffer, const WMTTextureInfo &info,
-    unsigned bytes_per_row, Flags<TextureAllocationFlag> flags
+    unsigned bytes_per_row, Flags<TextureAllocationFlag> flags, uint64_t buffer_offset
 ) :
     descriptor(descriptor),
     mappedMemory(mapped_buffer),
     buffer_(std::move(buffer)),
     flags_(flags) {
   auto info_copy = info;
-  obj_ = buffer_.newTexture(info_copy, 0, bytes_per_row);
+  obj_ = buffer_.newTexture(info_copy, buffer_offset, bytes_per_row);
 
   gpuResourceID = info_copy.gpu_resource_id;
   machPort = 0;
@@ -133,6 +133,12 @@ Texture::createView(TextureViewDescriptor const &descriptor) {
   return TextureViewKey(descriptor, i, info_.mipmap_level_count);
 }
 
+TextureView::TextureView(WMT::Reference<WMT::Texture> &&texture, uint64_t gpu_resource_id) :
+    texture(std::move(texture)),
+    gpuResourceID(gpu_resource_id),
+    allocation(nullptr),
+    key(TextureViewKey()) {}
+
 Texture::Texture(const WMTTextureInfo &descriptor, WMT::Device device) :
     info_(descriptor),
     device_(device) {
@@ -174,6 +180,18 @@ Texture::Texture(
 }
 
 Rc<TextureAllocation>
+Texture::allocateOver(WMT::Buffer buffer, void *mapped, uint64_t offset, Flags<TextureAllocationFlag> flags) {
+  WMTTextureInfo info = info_; // copy
+  info.mach_port = 0;
+  /* The storage mode has to be the buffer's own -- a texture aliasing it
+   * cannot claim a different one -- so nothing is added here. */
+  info.options = WMTResourceHazardTrackingModeUntracked;
+  return new TextureAllocation(
+      this, WMT::Reference<WMT::Buffer>(buffer), mapped, info, bytes_per_row_, flags, offset
+  );
+}
+
+Rc<TextureAllocation>
 Texture::allocate(Flags<TextureAllocationFlag> flags) {
   WMTResourceOptions options = WMTResourceHazardTrackingModeUntracked;
   WMTTextureInfo info = info_; // copy
@@ -201,6 +219,20 @@ Texture::allocate(Flags<TextureAllocationFlag> flags) {
   }
   auto texture = flags.test(TextureAllocationFlag::Shared) ? device_.newSharedTexture(info) : device_.newTexture(info);
   return new TextureAllocation(this, std::move(texture), info, flags);
+}
+
+Rc<TextureAllocation>
+Texture::importTexture(WMT::Texture texture, uint64_t gpu_resource_id) {
+  if (!texture) return nullptr;
+  WMTTextureInfo info = info_;
+  info.gpu_resource_id = gpu_resource_id;
+  info.mach_port = 0;
+  Flags<TextureAllocationFlag> flags;
+  if (info.options & WMTResourceStorageModePrivate)
+    flags.set(TextureAllocationFlag::GpuPrivate);
+  if (!(info.usage & (WMTTextureUsageShaderWrite | WMTTextureUsageRenderTarget)))
+    flags.set(TextureAllocationFlag::ShaderReadonly);
+  return new TextureAllocation(this, WMT::Reference<WMT::Texture>(texture), info, flags);
 }
 
 Rc<TextureAllocation>

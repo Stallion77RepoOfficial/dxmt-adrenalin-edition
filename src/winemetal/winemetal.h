@@ -450,7 +450,22 @@ enum WMTPixelFormat : uint32_t {
 
   WMTPixelFormatBGRA4Unorm = WMTPixelFormatGBARSwizzle | WMTPixelFormatABGR4Unorm,
 
-  WMTPixelFormatCustomSwizzle = WMTPixelFormatRGB1Swizzle | WMTPixelFormatR001Swizzle | WMTPixelFormat0R01Swizzle | WMTPixelFormatGBARSwizzle,
+  /* How D3D9 fills the channels a format lacks: luminance repeated across
+   * red, green and blue, and 1 where D3D10 and later read 0. */
+  WMTPixelFormatRRR1Swizzle = 0x00080000,
+  WMTPixelFormatRRRGSwizzle = 0x00040000,
+  WMTPixelFormatRG11Swizzle = 0x00020000,
+  WMTPixelFormatR111Swizzle = 0x00010000,
+  /* INTZ: the depth in every channel. Below bit 24: a view descriptor keeps
+   * only 24 bits of the format. */
+  WMTPixelFormatRRRRSwizzle = 0x00008000,
+  /* ATI2: the two channels of BC5 swapped, then 1 1. */
+  WMTPixelFormatGR11Swizzle = 0x00004000,
+
+  WMTPixelFormatCustomSwizzle = WMTPixelFormatRGB1Swizzle | WMTPixelFormatR001Swizzle | WMTPixelFormat0R01Swizzle |
+                                WMTPixelFormatGBARSwizzle | WMTPixelFormatRRR1Swizzle | WMTPixelFormatRRRGSwizzle |
+                                WMTPixelFormatRG11Swizzle | WMTPixelFormatR111Swizzle | WMTPixelFormatRRRRSwizzle |
+                                WMTPixelFormatGR11Swizzle,
 };
 
 #define ORIGINAL_FORMAT(format) (format & ~WMTPixelFormatCustomSwizzle)
@@ -651,6 +666,12 @@ struct WMTDepthAttachmentInfo {
   uint16_t slice;
   uint32_t depth_plane;
   float clear_depth;
+  /* MSAA resolve; resolve_filter is an MTLMultisampleDepthResolveFilter. */
+  obj_handle_t resolve_texture;
+  uint16_t resolve_level;
+  uint16_t resolve_slice;
+  uint32_t resolve_depth_plane;
+  uint32_t resolve_filter;
 };
 
 struct WMTStencilAttachmentInfo {
@@ -661,6 +682,12 @@ struct WMTStencilAttachmentInfo {
   uint16_t slice;
   uint32_t depth_plane;
   uint8_t clear_stencil;
+  /* MSAA resolve; resolve_filter is an MTLMultisampleStencilResolveFilter. */
+  obj_handle_t resolve_texture;
+  uint16_t resolve_level;
+  uint16_t resolve_slice;
+  uint32_t resolve_depth_plane;
+  uint32_t resolve_filter;
 };
 
 struct WMTRenderPassInfo {
@@ -783,6 +810,101 @@ struct WMTRenderPipelineBlendInfo {
   enum WMTLogicOperation logic_operation;
 };
 
+/* MTLVertexFormat values. Taken from Metal's own enumerator, including the
+ * three-component variants that make the numbering non-obvious; the gate
+ * asserts these against MTLVertexFormat. */
+enum WMTVertexFormat : uint32_t {
+  WMTVertexFormatInvalid = 0,
+  WMTVertexFormatUChar2 = 1,
+  WMTVertexFormatUChar3 = 2,
+  WMTVertexFormatUChar4 = 3,
+  WMTVertexFormatChar2 = 4,
+  WMTVertexFormatChar3 = 5,
+  WMTVertexFormatChar4 = 6,
+  WMTVertexFormatUChar2Normalized = 7,
+  WMTVertexFormatUChar3Normalized = 8,
+  WMTVertexFormatUChar4Normalized = 9,
+  WMTVertexFormatChar2Normalized = 10,
+  WMTVertexFormatChar3Normalized = 11,
+  WMTVertexFormatChar4Normalized = 12,
+  WMTVertexFormatUShort2 = 13,
+  WMTVertexFormatUShort3 = 14,
+  WMTVertexFormatUShort4 = 15,
+  WMTVertexFormatShort2 = 16,
+  WMTVertexFormatShort3 = 17,
+  WMTVertexFormatShort4 = 18,
+  WMTVertexFormatUShort2Normalized = 19,
+  WMTVertexFormatUShort3Normalized = 20,
+  WMTVertexFormatUShort4Normalized = 21,
+  WMTVertexFormatShort2Normalized = 22,
+  WMTVertexFormatShort3Normalized = 23,
+  WMTVertexFormatShort4Normalized = 24,
+  WMTVertexFormatHalf2 = 25,
+  WMTVertexFormatHalf3 = 26,
+  WMTVertexFormatHalf4 = 27,
+  WMTVertexFormatFloat = 28,
+  WMTVertexFormatFloat2 = 29,
+  WMTVertexFormatFloat3 = 30,
+  WMTVertexFormatFloat4 = 31,
+  WMTVertexFormatInt = 32,
+  WMTVertexFormatInt2 = 33,
+  WMTVertexFormatInt3 = 34,
+  WMTVertexFormatInt4 = 35,
+  WMTVertexFormatUInt = 36,
+  WMTVertexFormatUInt2 = 37,
+  WMTVertexFormatUInt3 = 38,
+  WMTVertexFormatUInt4 = 39,
+  WMTVertexFormatInt1010102Normalized = 40,
+  WMTVertexFormatUInt1010102Normalized = 41,
+  WMTVertexFormatUChar4Normalized_BGRA = 42,
+  WMTVertexFormatUChar = 45,
+  WMTVertexFormatChar = 46,
+  WMTVertexFormatUCharNormalized = 47,
+  WMTVertexFormatCharNormalized = 48,
+  WMTVertexFormatUShort = 49,
+  WMTVertexFormatShort = 50,
+  WMTVertexFormatUShortNormalized = 51,
+  WMTVertexFormatShortNormalized = 52,
+  WMTVertexFormatHalf = 53,
+};
+
+enum WMTVertexStepFunction : uint32_t {
+  WMTVertexStepFunctionConstant = 0,
+  WMTVertexStepFunctionPerVertex = 1,
+  WMTVertexStepFunctionPerInstance = 2,
+};
+
+/* Hardware vertex fetch, which is what Metal Shader Converter emits by default.
+ * D3D carries the buffer stride on the vertex buffer view and so can change it
+ * per draw; Metal fixes it in the pipeline, so a pipeline is specific to the
+ * strides it was built with. */
+struct WMTVertexAttributeDesc {
+  uint32_t index;
+  enum WMTVertexFormat format;
+  uint32_t offset;
+  uint32_t buffer_index;
+};
+
+STATIC_ASSERT(sizeof(WMTVertexAttributeDesc) == 16);
+
+struct WMTVertexBufferLayoutDesc {
+  uint32_t index;
+  uint32_t stride;
+  enum WMTVertexStepFunction step_function;
+  uint32_t step_rate;
+};
+
+STATIC_ASSERT(sizeof(WMTVertexBufferLayoutDesc) == 16);
+
+struct WMTVertexDescriptorInfo {
+  struct WMTConstMemoryPointer attributes; // WMTVertexAttributeDesc[]
+  struct WMTConstMemoryPointer layouts;    // WMTVertexBufferLayoutDesc[]
+  uint32_t num_attributes;
+  uint32_t num_layouts;
+};
+
+STATIC_ASSERT(sizeof(WMTVertexDescriptorInfo) == 24);
+
 struct WMTRenderPipelineInfo {
   struct WMTColorAttachmentBlendInfo colors[8];
   bool alpha_to_coverage_enabled;
@@ -806,6 +928,9 @@ struct WMTRenderPipelineInfo {
   uint8_t num_binary_archives_for_lookup;
   bool fail_on_binary_archive_miss;
   uint8_t padding[6];
+  /* Null leaves the pipeline without one, which is what shaders that fetch
+   * their own vertices need. */
+  struct WMTConstMemoryPointer vertex_descriptor; // const WMTVertexDescriptorInfo *
 };
 
 struct WMTMeshRenderPipelineInfo {
@@ -1152,6 +1277,9 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandDXMTTessellationMeshDrawIndirect,
   WMTRenderCommandDXMTTessellationMeshDrawIndexedIndirect,
   WMTRenderCommandDispatchThreadsPerTile,
+  /* Appended: the fragment counterpart existed, the vertex one did not.
+   * Values are an ABI between the PE and unix halves -- append only. */
+  WMTRenderCommandSetVertexBytes,
 };
 
 struct wmtcmd_render_nop {
@@ -1537,6 +1665,10 @@ WINEMETAL_API uint64_t MTLTexture_height(obj_handle_t texture);
 WINEMETAL_API uint64_t MTLTexture_depth(obj_handle_t texture);
 WINEMETAL_API uint64_t MTLTexture_arrayLength(obj_handle_t texture);
 WINEMETAL_API uint64_t MTLTexture_mipmapLevelCount(obj_handle_t texture);
+WINEMETAL_API void MTLTexture_getBytes(
+    obj_handle_t texture, struct WMTMemoryPointer data, uint64_t bytes_per_row, uint64_t bytes_per_image,
+    struct WMTOrigin origin, struct WMTSize size, uint64_t level, uint64_t slice
+);
 WINEMETAL_API void MTLTexture_replaceRegion(
     obj_handle_t texture, struct WMTOrigin origin, struct WMTSize size, uint64_t level, uint64_t slice,
     struct WMTMemoryPointer data, uint64_t bytes_per_row, uint64_t bytes_per_image
@@ -1877,7 +2009,8 @@ WINEMETAL_API void WMTGetOSVersion(uint64_t *major, uint64_t *minor, uint64_t *p
 enum WMTMetalVersion : uint32_t {
   WMTMetal310 = 310,
   WMTMetal320 = 320,
-  WMTMetalVersionMax = WMTMetal320,
+  WMTMetal400 = 400,
+  WMTMetalVersionMax = WMTMetal400,
 };
 
 WINEMETAL_API obj_handle_t MTLDevice_newBinaryArchive(obj_handle_t device, const char *url, obj_handle_t *err_out);
@@ -1953,5 +2086,79 @@ struct WMTTileRenderPipelineInfo {
 WINEMETAL_API obj_handle_t MTLDevice_newTileRenderPipelineState(
     obj_handle_t device, const struct WMTTileRenderPipelineInfo *info, obj_handle_t *err_out
 );
+
+/* Heaps back D3D12 placed resources: one suballocated block of memory that
+ * several resources can be created into, optionally aliasing each other.
+ * WMTHeapTypePlacement is the mode that gives explicit control over placement
+ * and is the one D3D12 needs; Automatic does not accept an offset. */
+enum WMTHeapType : uint8_t {
+  WMTHeapTypeAutomatic = 0,
+  WMTHeapTypePlacement = 1,
+  WMTHeapTypeSparse = 2,
+};
+
+struct WMTHeapInfo {
+  uint64_t size;                   // in
+  enum WMTResourceOptions options; // in
+  enum WMTHeapType type;           // in
+  uint8_t padding[7];
+};
+
+STATIC_ASSERT(sizeof(WMTHeapInfo) == 24);
+
+struct WMTSizeAndAlign {
+  uint64_t size;
+  uint64_t align;
+};
+
+STATIC_ASSERT(sizeof(WMTSizeAndAlign) == 16);
+
+WINEMETAL_API obj_handle_t MTLDevice_newHeap(obj_handle_t device, const struct WMTHeapInfo *info);
+
+/* Sizing queries for building a heap large enough for a set of resources. The
+ * alignment also constrains the offsets passed to MTLHeap_newBuffer/newTexture. */
+WINEMETAL_API void MTLDevice_heapBufferSizeAndAlign(
+    obj_handle_t device, uint64_t length, enum WMTResourceOptions options, struct WMTSizeAndAlign *out
+);
+WINEMETAL_API void MTLDevice_heapTextureSizeAndAlign(
+    obj_handle_t device, const struct WMTTextureInfo *info, struct WMTSizeAndAlign *out
+);
+
+/* Placed resources. The info structs are the same ones the device-level
+ * creators use, and their out fields (gpu_address, gpu_resource_id) are filled
+ * the same way. The resource's storage mode must match the heap's. */
+WINEMETAL_API obj_handle_t MTLHeap_newBuffer(obj_handle_t heap, struct WMTBufferInfo *info, uint64_t offset);
+WINEMETAL_API obj_handle_t MTLHeap_newTexture(obj_handle_t heap, struct WMTTextureInfo *info, uint64_t offset);
+
+enum WMTHeapProperty : uint32_t {
+  WMTHeapPropertySize = 0,
+  WMTHeapPropertyUsedSize = 1,
+  WMTHeapPropertyCurrentAllocatedSize = 2,
+  /* Uses the arg as the alignment to test against. */
+  WMTHeapPropertyMaxAvailableSize = 3,
+};
+
+WINEMETAL_API uint64_t MTLHeap_property(obj_handle_t heap, enum WMTHeapProperty prop, uint64_t arg);
+
+/* A converted vertex function's stage_in attributes.
+ *
+ * Metal Shader Converter numbers attributes in the order the shader declares
+ * them, counting system values, so the numbering cannot be derived from a D3D
+ * input layout. The names it emits are lowercase(SemanticName) followed by
+ * SemanticIndex, which is what matches them back up. */
+struct WMTVertexAttributeInfo {
+  uint32_t index;
+  uint32_t data_type;
+  uint8_t active;
+  uint8_t padding[3];
+  char name[64];
+};
+
+STATIC_ASSERT(sizeof(WMTVertexAttributeInfo) == 76);
+
+/* Writes at most `capacity` entries and returns how many the function has, so a
+ * null out is a way to size the array first. */
+WINEMETAL_API uint32_t
+MTLFunction_vertexAttributes(obj_handle_t function, struct WMTVertexAttributeInfo *out, uint32_t capacity);
 
 #endif

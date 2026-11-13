@@ -39,16 +39,20 @@ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Devic
     timestamp_state_(device),
     device_(device),
     queue_(queue) {
+  /* What a shader samples through a slot with no sampler bound: D3D11's
+   * default sampler state -- trilinear, clamped, the whole mip chain. A
+   * sampler that ignored the mips made SampleLevel read level 0 whatever level
+   * it asked for. */
   dummy_sampler_info_.support_argument_buffers = true;
-  dummy_sampler_info_.border_color = WMTSamplerBorderColorTransparentBlack;
+  dummy_sampler_info_.border_color = WMTSamplerBorderColorOpaqueWhite;
   dummy_sampler_info_.compare_function = WMTCompareFunctionNever;
   dummy_sampler_info_.normalized_coords = true;
   dummy_sampler_info_.r_address_mode = WMTSamplerAddressModeClampToEdge;
   dummy_sampler_info_.s_address_mode = WMTSamplerAddressModeClampToEdge;
   dummy_sampler_info_.t_address_mode = WMTSamplerAddressModeClampToEdge;
-  dummy_sampler_info_.min_filter = WMTSamplerMinMagFilterNearest;
-  dummy_sampler_info_.mag_filter = WMTSamplerMinMagFilterNearest;
-  dummy_sampler_info_.mip_filter = WMTSamplerMipFilterNotMipmapped;
+  dummy_sampler_info_.min_filter = WMTSamplerMinMagFilterLinear;
+  dummy_sampler_info_.mag_filter = WMTSamplerMinMagFilterLinear;
+  dummy_sampler_info_.mip_filter = WMTSamplerMipFilterLinear;
   dummy_sampler_info_.lod_min_clamp = 0.0f;
   dummy_sampler_info_.lod_max_clamp = FLT_MAX;
   dummy_sampler_info_.max_anisotroy = 1;
@@ -522,6 +526,7 @@ ArgumentEncodingContext::resolveTexture(
   encoder_info->fence_update = {encoder_info->id};
   encoder_current = encoder_info;
 
+  encoder_info->depth_stencil_planes = DepthStencilPlanarFlags(src->pixelFormat());
   encoder_info->src = access(src, src_view, ResourceAccess::Read);
   encoder_info->dst = access(dst, dst_view, ResourceAccess::Write);
 
@@ -708,12 +713,17 @@ ArgumentEncodingContext::endPass() {
       vro_state_.endEncoder();
       auto render_encoder = static_cast<RenderEncoderData *>(encoder_current);
 
-      if (render_encoder->depth.attachment && !(render_encoder->dsv_readonly_flags & 1))
+      /* A view over memory DXMT did not allocate has no allocation to track --
+       * D3D12 places its own textures in a heap it owns, and handles their
+       * residency itself. See TextureView's unowned constructor. */
+      if (render_encoder->depth.attachment && render_encoder->depth.attachment->allocation &&
+          !(render_encoder->dsv_readonly_flags & 1))
         access<PipelineStage::Pixel>(
             render_encoder->depth.attachment->allocation->descriptor, render_encoder->depth.attachment->key,
             ResourceAccess::Write
         );
-      if (render_encoder->stencil.attachment && !(render_encoder->dsv_readonly_flags & 2))
+      if (render_encoder->stencil.attachment && render_encoder->stencil.attachment->allocation &&
+          !(render_encoder->dsv_readonly_flags & 2))
         access<PipelineStage::Pixel>(
             render_encoder->stencil.attachment->allocation->descriptor, render_encoder->stencil.attachment->key,
             ResourceAccess::Write
@@ -1142,13 +1152,36 @@ ArgumentEncodingContext::flushCommands(WMT::CommandBuffer cmdbuf, uint64_t seqId
     }
     case EncoderType::Resolve: {
       auto data = static_cast<ResolveEncoderData *>(current);
+      /* This pass has no draws, so nothing in it runs in the fragment stage
+       * its fence waits are placed before: its load action reads the source
+       * without waiting for the encoder that wrote it. A queue barrier orders
+       * it. (A resolve right after the pass that drew the source never gets
+       * here: it is folded into that pass's store action.) */
+      if (!data->fence_wait.empty())
+        barrierOnQueue(cmdbuf);
       {
         WMTRenderPassInfo info;
         WMT::InitializeRenderPassInfo(info);
-        info.colors[0].texture = data->src.texture();
-        info.colors[0].load_action = WMTLoadActionLoad;
-        info.colors[0].store_action = WMTStoreActionStoreAndMultisampleResolve;
-        info.colors[0].resolve_texture = data->dst.texture();
+        /* A depth/stencil texture cannot be a colour attachment: it resolves
+         * through its own attachments, to sample 0 of each. */
+        if (data->depth_stencil_planes & 1) {
+          info.depth.texture = data->src.texture();
+          info.depth.load_action = WMTLoadActionLoad;
+          info.depth.store_action = WMTStoreActionStoreAndMultisampleResolve;
+          info.depth.resolve_texture = data->dst.texture();
+        }
+        if (data->depth_stencil_planes & 2) {
+          info.stencil.texture = data->src.texture();
+          info.stencil.load_action = WMTLoadActionLoad;
+          info.stencil.store_action = WMTStoreActionStoreAndMultisampleResolve;
+          info.stencil.resolve_texture = data->dst.texture();
+        }
+        if (!data->depth_stencil_planes) {
+          info.colors[0].texture = data->src.texture();
+          info.colors[0].load_action = WMTLoadActionLoad;
+          info.colors[0].store_action = WMTStoreActionStoreAndMultisampleResolve;
+          info.colors[0].resolve_texture = data->dst.texture();
+        }
 
         auto encoder = cmdbuf.renderCommandEncoder(info);
         encoder.setLabel(WMT::String::string("ResolvePass", WMTUTF8StringEncoding));

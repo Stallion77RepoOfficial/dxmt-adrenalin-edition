@@ -6,6 +6,9 @@
 #include "winemetal.h"
 #include <atomic>
 
+#include <memory>
+#include "dxmt_hud_renderer.hpp"
+
 namespace dxmt {
 
 struct DXMTPresentMetadata {
@@ -92,6 +95,9 @@ private:
   WMT::Reference<WMT::Texture> gamma_lut_texture_;
   WMT::Reference<WMT::RenderPipelineState> present_blit_;
   WMT::Reference<WMT::RenderPipelineState> present_scale_;
+  /* Built on the first present that finds the HUD switched on, so a run
+   * without DXMT_HUD never pays for the font atlas or the pipeline. */
+  std::unique_ptr<HudRenderer> hud_renderer_;
   std::atomic_flag pso_valid = 0;
   uint64_t frame_requested_ = 0;
   CpuFence frame_presented_ = 0;

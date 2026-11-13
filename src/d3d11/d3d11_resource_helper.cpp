@@ -338,7 +338,25 @@ CreateMTLTextureDescriptorInternal(
     case DXGI_FORMAT_R24G8_TYPELESS:
       break;
     default:
-      ERR("Unhandled depth stencil format ", Format);
+      /* Not a format that can carry depth. D3D11 refuses the binding rather
+       * than picking something; building the texture anyway produced a colour
+       * pixel format with a depth usage, which Metal rejects with an assertion
+       * that takes the process down instead of failing the call. */
+      return E_INVALIDARG;
+    }
+  }
+
+  /* And the reverse: the four fully-typed depth formats cannot be colour
+   * targets. The typeless ones above can -- R32_TYPELESS as an R32_FLOAT
+   * render target is legal -- so they are not listed here. */
+  if (BindFlags & D3D11_BIND_RENDER_TARGET) {
+    switch (Format) {
+    case DXGI_FORMAT_D16_UNORM:
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+    case DXGI_FORMAT_D32_FLOAT:
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+      return E_INVALIDARG;
+    default:
       break;
     }
   }
@@ -422,8 +440,15 @@ CreateMTLTextureDescriptorInternal(
     break;
   case D3D11_RESOURCE_DIMENSION_TEXTURE2D:
     if (MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE) {
-      D3D11_ASSERT(ArraySize / 6);
-      D3D11_ASSERT((ArraySize % 6) == 0);
+      /* A cube needs six faces, and the code below divides by six, so fewer
+       * than that has nothing to build and used to abort the process on an
+       * assertion. Not a multiple of six, though: D3D11 accepts a cube
+       * texture with any array size from six up -- Wine's suite creates them
+       * with nine and eleven slices and expects S_OK -- and the remainder
+       * simply is not addressable as a cube. Requiring a multiple rejected
+       * textures that are legal. */
+      if (ArraySize < 6)
+        return E_INVALIDARG;
       if ((ArraySize / 6) > 1) {
         pDescOut->type = WMTTextureTypeCubeArray;
         pDescOut->array_length = ArraySize / 6;

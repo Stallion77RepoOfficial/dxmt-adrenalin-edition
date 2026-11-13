@@ -120,6 +120,13 @@ public:
     auto t2 = clock::now();
     statistics.encode_prepare_interval += (t1 - t0);
     statistics.encode_flush_interval += (t2 - t1);
+    statistics.encoded_command_count += list_enc.last_command_count;
+    statistics.slow_command_count += list_enc.last_slow_commands;
+    if (list_enc.last_worst_command > statistics.worst_command) {
+      statistics.worst_command = list_enc.last_worst_command;
+      statistics.worst_command_index = list_enc.last_worst_index;
+      statistics.worst_command_vptr = (uint64_t)list_enc.last_worst_vptr;
+    }
   };
 
   uint64_t chunk_id;
@@ -166,6 +173,7 @@ private:
   CpuFence cpu_coherent;
   CpuFence frame_latency_fence_;
   std::atomic_bool stopped;
+  std::atomic_bool device_wedged_ = false;
 
   std::array<CommandChunk, kCommandChunkCount> chunks;
   uint64_t encoder_seq = 1;
@@ -279,6 +287,13 @@ public:
   void
   WaitCPUFence(uint64_t seq) {
     cpu_coherent.wait(seq);
+  };
+
+  // True once a committed command buffer failed to complete within the hang
+  // detection timeout; the queue then drains without waiting on the GPU.
+  bool
+  IsDeviceWedged() {
+    return device_wedged_.load(std::memory_order_relaxed);
   };
 
   std::tuple<WMT::Buffer, uint64_t>

@@ -7,8 +7,9 @@
 #include "dxgi_output.hpp"
 #include "d3d11_context.hpp"
 #include "dxmt_context.hpp"
-#include "dxmt_hud_state.hpp"
 #include "dxmt_statistics.hpp"
+#include "dxmt_hud_state.hpp"
+#include "dxmt_info.hpp"
 #include "dxmt_presenter.hpp"
 #include "log/log.hpp"
 #include "d3d11_resource.hpp"
@@ -128,8 +129,7 @@ public:
       desc_(*pDesc),
       device_context_(pDevice->GetImmediateContextPrivate()),
       hWnd(hWnd),
-      monitor_(wsi::getWindowMonitor(hWnd)),
-      hud(WMT::DeveloperHUDProperties::instance()) {
+      monitor_(wsi::getWindowMonitor(hWnd)) {
 
     native_view_ = WMT::CreateMetalViewFromHWND((intptr_t)hWnd, pDevice->GetMTLDevice(), layer_weak_);
 
@@ -137,6 +137,8 @@ public:
       ERR("Failed to create metal view, it seems like your Wine has no exported symbols needed by DXMT.");
       abort();
     }
+
+    hud.initialize(GetVersionDescriptionText(pDevice->GetDirectXVersion(), pDevice->GetFeatureLevel()));
 
     if constexpr (EnableMetalFX) {
       scale_factor = std::max(Config::getInstance().getOption<float>("d3d11.metalSpatialUpscaleFactor", 2), 1.0f);
@@ -176,8 +178,6 @@ public:
     }
 
     handle_alt_tab_ = Config::getInstance().getOption<bool>("dxgi.handleAltTab", false);
-
-    hud.initialize(GetVersionDescriptionText(device_->GetDirectXVersion(), device_->GetFeatureLevel()));
 
     backbuffer_desc_ = D3D11_TEXTURE2D_DESC1 {
       .Width = desc_.Width,
@@ -251,12 +251,23 @@ public:
   HRESULT
   STDMETHODCALLTYPE
   GetBuffer(UINT buffer_idx, REFIID riid, void **surface) final {
-    if (buffer_idx == 0) {
+    InitReturnPtr(surface);
+    if (buffer_idx == 0)
       return backbuffer_->QueryInterface(riid, surface);
-    } else {
-      ERR("Non zero-index buffer is not supported");
-      return DXGI_ERROR_UNSUPPORTED;
+    /* The other buffers of a sequential chain hold the frames presented
+     * before; a discarding chain has only buffer 0 to give out. */
+    if (buffer_idx >= desc_.BufferCount || desc_.SwapEffect == DXGI_SWAP_EFFECT_DISCARD ||
+        desc_.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD)
+      return DXGI_ERROR_INVALID_CALL;
+    while (older_buffers_.size() < desc_.BufferCount - 1) {
+      Com<D3D11ResourceCommon> buffer;
+      if (FAILED(dxmt::CreateDeviceTexture2D(
+              device_, &backbuffer_desc_, nullptr, reinterpret_cast<ID3D11Texture2D1 **>(&buffer)
+          )))
+        return E_OUTOFMEMORY;
+      older_buffers_.push_back(buffer.ptr());
     }
+    return older_buffers_[buffer_idx - 1]->QueryInterface(riid, surface);
   };
 
   HRESULT
@@ -476,7 +487,9 @@ public:
   STDMETHODCALLTYPE
   ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format,
                 UINT flags) final {
-    /* BufferCount ignored */
+    if (BufferCount)
+      desc_.BufferCount = BufferCount;
+    older_buffers_.clear(); // created again, at the new size, when asked for
     if (Width == 0 || Height == 0) {
       wsi::getWindowSize(hWnd, &desc_.Width, &desc_.Height);
     } else {
@@ -786,8 +799,8 @@ public:
         scaler_info.output_height = upscaled->height();
         ctx.upscale(backbuffer, upscaled, scaler);
         ctx.present(upscaled, presenter, vsync_duration, state.metadata);
-        ReleaseSemaphore(present_semaphore_, 1, nullptr);
         this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
+        ReleaseSemaphore(present_semaphore_, 1, nullptr);
       });
     } else {
       chunk->emitcc([
@@ -796,8 +809,22 @@ public:
         backbuffer = backbuffer_->texture()
       ](ArgumentEncodingContext &ctx) mutable {
         ctx.present(backbuffer, presenter, vsync_duration, state.metadata);
-        ReleaseSemaphore(present_semaphore_, 1, nullptr);
         this->UpdateStatistics(ctx.queue().statistics, ctx.currentFrameId());
+        ReleaseSemaphore(present_semaphore_, 1, nullptr);
+      });
+    }
+    if (!older_buffers_.empty()) {
+      /* The buffers keep their identity and pass their contents along: 1
+       * becomes 0, 2 becomes 1, and the frame just presented becomes the last
+       * one. A rename of each texture's storage, in command order. */
+      std::vector<Rc<Texture>> buffers{backbuffer_->texture()};
+      for (auto &buffer : older_buffers_)
+        buffers.push_back(buffer->texture());
+      chunk->emitcc([buffers = std::move(buffers)](ArgumentEncodingContext &) mutable {
+        Rc<TextureAllocation> presented = buffers[0]->current();
+        for (size_t i = 0; i + 1 < buffers.size(); i++)
+          auto _ = buffers[i]->rename(Rc<TextureAllocation>(buffers[i + 1]->current()));
+        auto _ = buffers.back()->rename(std::move(presented));
       });
     }
     device_context_->Commit();
@@ -865,10 +892,13 @@ public:
     }
     if (hud.shows(HudElement::Encode)) {
       hud.printLine(std::format(
-          "Encode: {:4.1f}+{:4.1f}+{:4.1f}={:4.1f}", std::min(average.encode_prepare_interval.count() / 1000000.0, 99.9),
-          std::min((average.encode_flush_interval - average.drawable_blocking_interval).count() / 1000000.0, 99.9),
-          std::min(average.drawable_blocking_interval.count() / 1000000.0, 99.9),
-          std::min((average.encode_prepare_interval + average.encode_flush_interval).count() / 1000000.0, 99.9)
+          "Enc {:.1f} cmds {} slow {} worst {:.1f}ms@{} skip {} vptr {:#x}", (average.encode_prepare_interval.count() / 1000000.0),
+          (unsigned long long)average.encoded_command_count,
+          (unsigned long long)statistics.max().slow_command_count,
+          statistics.max().worst_command.count() / 1000000.0,
+          (unsigned long long)statistics.max().worst_command_index,
+          statistics.max().async_pipeline_skips,
+          statistics.max().worst_command_vptr
       ));
     }
     if (hud.shows(HudElement::RenderPass)) {
@@ -1073,6 +1103,7 @@ private:
   D3D11_TEXTURE2D_DESC1 backbuffer_desc_;
   IMTLD3D11DeviceContext* device_context_;
   Com<D3D11ResourceCommon, false> backbuffer_;
+  std::vector<Com<D3D11ResourceCommon, false>> older_buffers_; // see GetBuffer
   HANDLE present_semaphore_;
   std::unique_ptr<CpuFence> frame_latency_fence_;
   HWND hWnd;
@@ -1083,8 +1114,10 @@ private:
   DXGI_COLOR_SPACE_TYPE colorspace_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
   double init_refresh_rate_ = DBL_MAX;
   int preferred_max_frame_rate = 0;
-  HUDState hud;
   Rc<Presenter> presenter;
+  /* Text half of DXMT's own HUD: composed here every frame and published to
+   * the mailbox the presenter's HudRenderer draws from. */
+  HUDState hud;
   ModeSetGuard modeset_guard_;
   dxmt::mutex mutex_;
 
@@ -1111,6 +1144,15 @@ CreateSwapChain(
   if (GetProcessId(GetCurrentProcess()) != window_process_id) {
     ERR("CreateSwapChain: cross-process swapchain not supported yet");
     return E_FAIL;
+  }
+
+  /* A back buffer format has to be one a CAMetalLayer can present. Anything
+   * else -- a compressed format, a depth format, a typeless one -- is refused
+   * here, because the layer is told its pixel format long after this call and
+   * an invalid one wedges it rather than failing. */
+  if (ConvertSwapChainFormat(pDesc->Format) == WMTPixelFormatInvalid) {
+    WARN("CreateSwapChain: unsupported back buffer format ", pDesc->Format);
+    return E_INVALIDARG;
   }
 
   Com<IMTLDXGIDevice> layer_factory;

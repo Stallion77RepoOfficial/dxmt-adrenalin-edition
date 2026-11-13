@@ -1,6 +1,5 @@
 #pragma once
 
-#include "Metal.hpp"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -19,10 +18,16 @@ enum class HudElement : uint32_t {
   Scaler     = 1u << 6, // MetalFX scaler info
 };
 
+// Text side of DXMT's own HUD overlay. The swapchain composes statistics
+// lines each frame through begin()/printLine()/end(); end() publishes them to
+// the shared HudContents mailbox that the presenter-side HudRenderer draws
+// from. Fully independent of Apple's Metal Performance HUD: DXMT_HUD alone
+// enables it, MTL_HUD_ENABLED is neither read nor written.
 class HUDState {
 public:
-  // Registers the heading label when either DXMT_HUD or Apple's Metal HUD is
-  // enabled. DXMT_HUD controls the optional extra DXMT statistics lines.
+  HUDState() = default;
+
+  // Parses DXMT_HUD and publishes the heading (version + feature level).
   void initialize(const std::string &heading);
 
   void begin();
@@ -43,13 +48,9 @@ public:
     return enabled_ && (elements_ & static_cast<uint32_t>(element));
   }
 
-  HUDState(WMT::DeveloperHUDProperties hud) : hud_(hud){};
-
 private:
-  WMT::DeveloperHUDProperties hud_;
-  std::vector<WMT::Reference<WMT::String>> line_labels_;
-  WMT::Reference<WMT::Object> pool_;
-  unsigned current_line_ = 0;
+  std::string heading_;
+  std::vector<std::string> staging_lines_;
   bool enabled_ = false;
   uint32_t elements_ = 0;
 };
